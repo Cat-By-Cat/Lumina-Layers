@@ -30,15 +30,14 @@ def start_browser():
 if __name__ == "__main__":
 
     # 1. Start System Tray
-    # On macOS, pystray can cause trace trap errors when running alongside Gradio
-    # Disable system tray on macOS to avoid crashes
-    if sys.platform != "darwin":  # Only enable on non-macOS systems
-        print("🚀 Starting System Tray...")
-        try:
-            tray = LuminaTray(port=PORT)
-            tray.run()
-        except Exception as e:
-            print(f"⚠️ Warning: System tray failed to start: {e}")
+    # macOS support: Uses run_detached() to avoid conflicts with Gradio
+    print("🚀 Starting System Tray...")
+    try:
+        tray = LuminaTray(port=PORT)
+        tray.run()
+    except Exception as e:
+        print(f"⚠️ Warning: System tray failed to start: {e}")
+        print("   The application will continue without system tray support.")
 
     # 2. Start Browser Thread
     threading.Thread(target=start_browser, daemon=True).start()
