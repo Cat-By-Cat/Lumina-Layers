@@ -118,6 +118,24 @@ class LuminaImageProcessor:
         # Load image
         img = Image.open(image_path).convert('RGBA')
         
+        # DEBUG: Check original image properties
+        print(f"[IMAGE_PROCESSOR] Original image: {image_path}")
+        print(f"[IMAGE_PROCESSOR] Image mode: {Image.open(image_path).mode}")
+        print(f"[IMAGE_PROCESSOR] Image size: {Image.open(image_path).size}")
+        
+        # Check if image has transparency
+        original_img = Image.open(image_path)
+        has_alpha = original_img.mode in ('RGBA', 'LA') or (original_img.mode == 'P' and 'transparency' in original_img.info)
+        print(f"[IMAGE_PROCESSOR] Has alpha channel: {has_alpha}")
+        
+        if has_alpha:
+            # Check alpha channel statistics
+            if original_img.mode != 'RGBA':
+                original_img = original_img.convert('RGBA')
+            alpha_data = np.array(original_img)[:, :, 3]
+            print(f"[IMAGE_PROCESSOR] Alpha stats: min={alpha_data.min()}, max={alpha_data.max()}, mean={alpha_data.mean():.1f}")
+            print(f"[IMAGE_PROCESSOR] Transparent pixels (alpha<10): {np.sum(alpha_data < 10)}")
+        
         # Calculate target resolution
         if use_high_fidelity:
             # High-precision mode: 10 pixels/mm
@@ -148,6 +166,11 @@ class LuminaImageProcessor:
         rgb_arr = img_arr[:, :, :3]
         alpha_arr = img_arr[:, :, 3]
         
+        # CRITICAL FIX: Identify transparent pixels BEFORE color processing
+        # This prevents transparent areas from being matched to LUT colors
+        mask_transparent_initial = alpha_arr < 10
+        print(f"[IMAGE_PROCESSOR] Found {np.sum(mask_transparent_initial)} transparent pixels (alpha<10)")
+        
         # Color processing and matching
         debug_data = None
         if use_high_fidelity:
@@ -159,13 +182,14 @@ class LuminaImageProcessor:
                 rgb_arr, target_h, target_w
             )
         
-        # Background removal
-        mask_transparent = alpha_arr < 10
+        # Background removal - combine alpha transparency with optional auto-bg
+        mask_transparent = mask_transparent_initial.copy()
         if auto_bg:
             bg_color = bg_reference[0, 0]
             diff = np.sum(np.abs(bg_reference - bg_color), axis=-1)
             mask_transparent = np.logical_or(mask_transparent, diff < bg_tol)
         
+        # Apply transparency mask to material matrix
         material_matrix[mask_transparent] = -1
         mask_solid = ~mask_transparent
         

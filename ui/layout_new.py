@@ -382,7 +382,8 @@ def create_converter_tab_content(lang: str) -> dict:
             # Input image
             components['image_conv_image_label'] = gr.Image(
                 label=I18n.get('conv_image_label', lang),
-                type="filepath"
+                type="filepath",
+                image_mode="RGBA"  # Force RGBA mode to preserve alpha channel
             )
                 
             # Parameter settings
