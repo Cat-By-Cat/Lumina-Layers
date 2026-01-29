@@ -46,9 +46,9 @@ def generate_simulated_reference():
 def rotate_image(img, direction):
     if img is None:
         return None
-    if direction == "左旋 90°":
+    if direction in ("左旋 90°", "Rotate Left 90°"):
         return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    elif direction == "右旋 90°":
+    elif direction in ("右旋 90°", "Rotate Right 90°"):
         return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
     return img
 
