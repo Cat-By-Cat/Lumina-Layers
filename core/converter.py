@@ -268,6 +268,19 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
             print(f"[CONVERTER] Loop creation failed: {e}")
     
     # ========== Step 8: Export 3MF ==========
+    # 单面模式需要 X 轴镜像修正，使 3MF 输出与预览/GLB 一致
+    is_single_sided = "单面" in structure_mode or "Single" in structure_mode
+    if is_single_sided:
+        model_width_mm = target_w * pixel_scale
+        mirror_transform = np.array([
+            [-1, 0, 0, model_width_mm],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        for geom_name in list(scene.geometry.keys()):
+            scene.geometry[geom_name].apply_transform(mirror_transform)
+    
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     out_path = os.path.join(OUTPUT_DIR, f"{base_name}_Lumina.3mf")
     scene.export(out_path)
