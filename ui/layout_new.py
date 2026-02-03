@@ -608,7 +608,8 @@ def create_converter_tab_content(lang: str) -> dict:
                 components['slider_conv_width'],
                 components['checkbox_conv_auto_bg'],
                 components['slider_conv_tolerance'],
-                components['radio_conv_color_mode']
+                components['radio_conv_color_mode'],
+                components['radio_conv_modeling_mode']
             ],
             outputs=[conv_preview, conv_preview_cache, components['textbox_conv_status']]
     )

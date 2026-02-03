@@ -5,6 +5,7 @@ Contains all configuration classes, constants, and internationalization texts.
 """
 
 import os
+from enum import Enum
 
 
 # ========== Output Directory ==========
@@ -162,6 +163,12 @@ class I18N:
         if key in I18N.TEXTS:
             return I18N.TEXTS[key].get(lang, I18N.TEXTS[key].get('zh', key))
         return key
+
+
+class ModelingMode(str, Enum):
+    """建模模式枚举"""
+    HIGH_FIDELITY = "high-fidelity"  # 高保真模式
+    PIXEL = "pixel"  # 像素模式
 
 
 class ColorSystem:
