@@ -42,6 +42,7 @@ from core.converter import (
     detect_image_type,
     generate_auto_height_map
 )
+from core.heightmap_loader import HeightmapLoader
 from .styles import CUSTOM_CSS
 from .callbacks import (
     get_first_hint,
@@ -904,6 +905,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
                              add_loop, loop_width, loop_length, loop_hole, loop_pos,
                              modeling_mode, quantize_colors, color_replacements=None,
                              separate_backing=False, enable_relief=False, color_height_map=None,
+                             heightmap_path=None, heightmap_max_height=None,
                              enable_cleanup=True,
                              enable_outline=False, outline_width=2.0,
                              enable_cloisonne=False, wire_width_mm=0.4,
@@ -917,6 +919,8 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
         separate_backing: Boolean flag to separate backing as individual object (default: False)
         enable_relief: Boolean flag to enable 2.5D relief mode (default: False)
         color_height_map: Dict mapping hex colors to heights in mm (default: None)
+        heightmap_path: Optional path to heightmap image file (default: None)
+        heightmap_max_height: Optional max height for heightmap mode in mm (default: None)
 
     Returns:
         tuple: (file_or_zip_path, model3d_value, preview_image, status_text).
@@ -936,7 +940,9 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
     args = (lut_path, target_width_mm, spacer_thick, structure_mode, auto_bg, bg_tol,
             color_mode, add_loop, loop_width, loop_length, loop_hole, loop_pos,
             modeling_mode, quantize_colors, color_replacements, backing_color_name,
-            separate_backing, enable_relief, color_height_map, enable_cleanup,
+            separate_backing, enable_relief, color_height_map,
+            heightmap_path, heightmap_max_height,
+            enable_cleanup,
             enable_outline, outline_width,
             enable_cloisonne, wire_width_mm, wire_height_mm,
             free_color_set,
@@ -1949,33 +1955,54 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 info="调整当前选中颜色的总高度（包含光学层）"
             )
             
+            # Max relief height slider - extracted outside Accordion so it remains visible
+            # when heightmap mode hides the Accordion (shared by both auto-height and heightmap modes)
+            components['slider_conv_auto_height_max'] = gr.Slider(
+                minimum=2.0,
+                maximum=15.0,
+                value=5.0,
+                step=0.1,
+                label="最大浮雕高度 | Max Relief Height (mm)",
+                info="所有颜色的最大高度（相对于底板）",
+                visible=False
+            )
+
             # Auto Height Generator (only visible when relief mode is enabled)
-            with gr.Accordion(label="⚡ 自动高度生成器 | Auto Height Generator", open=False, visible=False) as conv_auto_height_accordion:
-                gr.Markdown("根据颜色明度自动生成归一化高度映射 | Automatically generate normalized heights based on color luminance")
-                
+            with gr.Accordion(label="⚡ 高度生成器 | Height Generator", open=True, visible=False) as conv_auto_height_accordion:
                 components['radio_conv_auto_height_mode'] = gr.Radio(
                     choices=[
                         ("深色凸起 | Darker Higher", "深色凸起"),
-                        ("浅色凸起 | Lighter Higher", "浅色凸起")
+                        ("浅色凸起 | Lighter Higher", "浅色凸起"),
+                        ("根据高度图 | Use Heightmap", "根据高度图")
                     ],
                     value="深色凸起",
                     label="排列规则 | Sorting Rule",
-                    info="选择哪种颜色应该更高"
-                )
-                
-                components['slider_conv_auto_height_max'] = gr.Slider(
-                    minimum=2.0,
-                    maximum=15.0,
-                    value=5.0,
-                    step=0.1,
-                    label="最大浮雕高度 | Max Relief Height (mm)",
-                    info="所有颜色的最大高度（相对于底板）"
+                    info="选择高度分配方式：按颜色明度或使用自定义高度图"
                 )
                 
                 components['btn_conv_auto_height_apply'] = gr.Button(
                     "✨ 一键生成高度 | Apply Auto Heights",
                     variant="primary"
                 )
+
+                # ========== Heightmap Upload Components (inside accordion) ==========
+                with gr.Row(visible=False) as conv_heightmap_row:
+                    components['image_conv_heightmap'] = gr.Image(
+                        type="filepath",
+                        label="上传高度图 | Upload Heightmap (PNG/JPG/BMP)",
+                        visible=True,
+                        height=200,
+                        sources=["upload"],
+                        interactive=True
+                    )
+                    components['image_conv_heightmap_preview'] = gr.Image(
+                        label="高度图预览 | Heightmap Preview",
+                        visible=False,
+                        interactive=False,
+                        height=200
+                    )
+                components['row_conv_heightmap'] = conv_heightmap_row
+                # ========== END Heightmap Upload Components ==========
             
             components['accordion_conv_auto_height'] = conv_auto_height_accordion
             
@@ -3027,18 +3054,60 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             )
     # ========== Relief / Cloisonné Mutual Exclusion ==========
     def on_relief_mode_toggle(enable_relief, selected_color, height_map, base_thickness):
-        """Toggle relief mode visibility and reset state; auto-disable cloisonné"""
+        """Toggle relief mode visibility and reset state; auto-disable cloisonné.
+        
+        Returns updates for:
+        - slider_conv_relief_height
+        - accordion_conv_auto_height
+        - slider_conv_auto_height_max
+        - row_conv_heightmap (heightmap upload row)
+        - image_conv_heightmap_preview
+        - conv_color_height_map
+        - conv_relief_selected_color
+        - radio_conv_auto_height_mode (reset to default)
+        - checkbox_conv_cloisonne_enable (auto-disable)
+        """
         if not enable_relief:
-            # Disable relief mode - hide slider, accordion, and clear state
-            return gr.update(visible=False), gr.update(visible=False), {}, None, gr.update()
+            # 关闭浮雕模式 - 隐藏所有浮雕相关控件
+            return (
+                gr.update(visible=False),   # slider_conv_relief_height
+                gr.update(visible=False),   # accordion_conv_auto_height
+                gr.update(visible=False),   # slider_conv_auto_height_max
+                gr.update(visible=False),   # row_conv_heightmap
+                gr.update(visible=False),   # image_conv_heightmap_preview
+                {},                         # conv_color_height_map
+                None,                       # conv_relief_selected_color
+                gr.update(value="深色凸起"), # radio_conv_auto_height_mode reset
+                gr.update(),                # checkbox_conv_cloisonne_enable (no change)
+            )
         else:
-            # Enable relief → disable cloisonné
+            # 开启浮雕模式 - 默认「深色凸起」，隐藏高度图上传区，自动关闭掐丝珐琅
             gr.Info("⚠️ 2.5D浮雕模式与掐丝珐琅模式互斥，已自动关闭掐丝珐琅 | Relief and Cloisonné are mutually exclusive, Cloisonné disabled")
             if selected_color:
                 current_height = height_map.get(selected_color, base_thickness)
-                return gr.update(visible=True, value=current_height), gr.update(visible=True), height_map, selected_color, gr.update(value=False)
+                return (
+                    gr.update(visible=True, value=current_height),  # slider_conv_relief_height
+                    gr.update(visible=True),    # accordion_conv_auto_height
+                    gr.update(visible=True),    # slider_conv_auto_height_max
+                    gr.update(visible=False),   # row_conv_heightmap (hidden for luminance mode)
+                    gr.update(visible=False),   # image_conv_heightmap_preview
+                    height_map,                 # conv_color_height_map
+                    selected_color,             # conv_relief_selected_color
+                    gr.update(value="深色凸起"), # radio_conv_auto_height_mode reset
+                    gr.update(value=False),     # checkbox_conv_cloisonne_enable (disable)
+                )
             else:
-                return gr.update(visible=False), gr.update(visible=True), height_map, selected_color, gr.update(value=False)
+                return (
+                    gr.update(visible=False),   # slider_conv_relief_height
+                    gr.update(visible=True),    # accordion_conv_auto_height
+                    gr.update(visible=True),    # slider_conv_auto_height_max
+                    gr.update(visible=False),   # row_conv_heightmap (hidden for luminance mode)
+                    gr.update(visible=False),   # image_conv_heightmap_preview
+                    height_map,                 # conv_color_height_map
+                    selected_color,             # conv_relief_selected_color
+                    gr.update(value="深色凸起"), # radio_conv_auto_height_mode reset
+                    gr.update(value=False),     # checkbox_conv_cloisonne_enable (disable)
+                )
 
     def on_cloisonne_mode_toggle(enable_cloisonne):
         """When cloisonné is enabled, auto-disable relief mode"""
@@ -3046,7 +3115,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             gr.Info("⚠️ 掐丝珐琅模式与2.5D浮雕模式互斥，已自动关闭浮雕 | Cloisonné and Relief are mutually exclusive, Relief disabled")
             return gr.update(value=False), gr.update(visible=False), gr.update(visible=False)
         return gr.update(), gr.update(), gr.update()
-
+    
     components['checkbox_conv_relief_mode'].change(
         on_relief_mode_toggle,
         inputs=[
@@ -3058,8 +3127,12 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         outputs=[
             components['slider_conv_relief_height'],
             components['accordion_conv_auto_height'],
+            components['slider_conv_auto_height_max'],
+            components['row_conv_heightmap'],
+            components['image_conv_heightmap_preview'],
             conv_color_height_map,
             conv_relief_selected_color,
+            components['radio_conv_auto_height_mode'],
             components['checkbox_conv_cloisonne_enable']
         ]
     )
@@ -3073,6 +3146,92 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             components['accordion_conv_auto_height']
         ]
     )
+
+    # ========== Sorting Rule Radio Change Handler ==========
+    def on_height_mode_change(mode):
+        """切换排列规则时，控制高度图上传区和一键生成按钮的显隐。
+        
+        Returns updates for:
+        - row_conv_heightmap
+        - btn_conv_auto_height_apply
+        - image_conv_heightmap_preview
+        """
+        if mode == "根据高度图":
+            return (
+                gr.update(visible=True),    # row_conv_heightmap - 显示高度图上传区
+                gr.update(visible=False),   # btn_conv_auto_height_apply - 隐藏一键生成按钮
+                gr.update(visible=False),   # image_conv_heightmap_preview
+            )
+        else:
+            return (
+                gr.update(visible=False),   # row_conv_heightmap - 隐藏高度图上传区
+                gr.update(visible=True),    # btn_conv_auto_height_apply - 显示一键生成按钮
+                gr.update(visible=False),   # image_conv_heightmap_preview
+            )
+    
+    components['radio_conv_auto_height_mode'].change(
+        on_height_mode_change,
+        inputs=[components['radio_conv_auto_height_mode']],
+        outputs=[
+            components['row_conv_heightmap'],
+            components['btn_conv_auto_height_apply'],
+            components['image_conv_heightmap_preview'],
+        ]
+    )
+
+    # ========== Heightmap Upload/Clear Handlers ==========
+    def on_heightmap_upload(heightmap_path):
+        """高度图上传回调 - 验证并显示预览。
+        
+        Returns updates for:
+        - image_conv_heightmap_preview
+        - textbox_conv_status
+        """
+        if not heightmap_path:
+            return on_heightmap_clear()
+        
+        result = HeightmapLoader.load_and_validate(heightmap_path)
+        
+        if result['success']:
+            status_parts = ["✅ 高度图加载成功"]
+            if result['original_size']:
+                w, h = result['original_size']
+                status_parts.append(f"尺寸: {w}x{h}")
+            for warn in result['warnings']:
+                status_parts.append(warn)
+            status_msg = " | ".join(status_parts)
+            
+            return (
+                gr.update(visible=True, value=result['thumbnail']),  # 显示预览
+                status_msg                  # 状态栏
+            )
+        else:
+            return (
+                gr.update(visible=False),   # 隐藏预览
+                result['error']             # 状态栏显示错误
+            )
+    
+    def on_heightmap_clear():
+        """高度图移除回调 - 清除预览。
+        
+        Returns updates for:
+        - image_conv_heightmap_preview
+        - textbox_conv_status
+        """
+        return (
+            gr.update(visible=False, value=None),  # 隐藏预览
+            ""                          # 清空状态栏
+        )
+    
+    components['image_conv_heightmap'].change(
+        on_heightmap_upload,
+        inputs=[components['image_conv_heightmap']],
+        outputs=[
+            components['image_conv_heightmap_preview'],
+            components['textbox_conv_status']
+        ]
+    )
+    # ========== END Heightmap Upload/Clear Handlers ==========
     
     # Hook into existing color selection event (when user clicks palette swatch or uses color trigger button)
     conv_color_trigger_btn.click(
@@ -3108,7 +3267,12 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     
     # Auto Height Generator Event Handler
     def on_auto_height_apply(cache, mode, max_relief_height, base_thickness):
-        """Generate automatic height mapping based on color luminance using normalization"""
+        """Generate automatic height mapping based on color luminance using normalization.
+        Skip if mode is '根据高度图' (heightmap mode uses uploaded image instead).
+        """
+        if mode == "根据高度图":
+            gr.Info("ℹ️ 当前为高度图模式，请上传高度图后直接点击生成按钮 | Heightmap mode: upload a heightmap and click Generate")
+            return gr.update()
         if cache is None:
             gr.Warning("⚠️ 请先生成预览图 | Please generate preview first")
             return {}
@@ -3182,6 +3346,8 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 components['checkbox_conv_separate_backing'],
                 components['checkbox_conv_relief_mode'],
                 conv_color_height_map,
+                components['image_conv_heightmap'],
+                components['slider_conv_auto_height_max'],
                 components['checkbox_conv_cleanup'],
                 components['checkbox_conv_outline_enable'],
                 components['slider_conv_outline_width'],
