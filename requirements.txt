@@ -12,6 +12,8 @@ lxml
 svglib
 reportlab
 colormath
+matplotlib
+pandas
 # Native Vector Engine dependencies
 svgelements>=1.9.0
 shapely>=2.0.0

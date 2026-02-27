@@ -672,3 +672,140 @@ def generate_bw_calibration_board(block_size_mm=5.0, gap_mm=0.8, backing_color="
         Image.fromarray(preview_arr),
         f"✅ BW (8x8边框版) 生成完毕 | 尺寸: {board_w:.1f}mm | 颜色: {', '.join(slot_names)}"
     )
+
+
+def generate_ks_step_card_3mf(layer_height: float = 0.08, num_steps: int = 5, 
+                               base_thickness: float = 0.6):
+    """
+    Generate K/S step calibration card as unified 3MF file.
+    
+    UPGRADE from ChromaStack's 3-STL approach:
+    - Single 3MF file with 3 material slots (Black Base, White Base, Test Color)
+    - Pre-aligned geometry (no manual assembly needed)
+    - Professional workflow integration
+    
+    Args:
+        layer_height: Layer height in mm (must match print settings)
+        num_steps: Number of test steps (3-10)
+        base_thickness: Backing thickness in mm
+    
+    Returns:
+        Tuple of (output_path, preview_image, status_message)
+    """
+    print(f"[K/S_STEP_CARD] Generating unified 3MF: {num_steps} steps, {layer_height}mm layers")
+    
+    # Geometry parameters (matching ChromaStack original)
+    BASE_WIDTH = 20.0           # Each base width (black/white)
+    CHIP_LENGTH_PER_STEP = 10.0 # Length per step
+    
+    card_width = 2 * BASE_WIDTH  # Total width = 40mm
+    card_length = num_steps * CHIP_LENGTH_PER_STEP  # Dynamic length based on steps
+    step_width = BASE_WIDTH      # Half for black base, half for white base
+    step_length = CHIP_LENGTH_PER_STEP
+    
+    # Calculate Z heights (matching ChromaStack: 1 layer, 2 layers, 3 layers, ...)
+    base_z = base_thickness
+    START_LAYERS = 1
+    step_heights = [layer_height * (START_LAYERS + i) for i in range(num_steps)]
+    
+    print(f"[K/S_STEP_CARD] Card dimensions: {card_width}mm × {card_length}mm")
+    print(f"[K/S_STEP_CARD] Step thicknesses: {[f'{h:.2f}mm' for h in step_heights]}")
+    
+    # Material slot configuration
+    MAT_BLACK = 0
+    MAT_WHITE = 1
+    MAT_TEST_COLOR = 2
+    
+    slot_names = ["Black Base", "White Base", "Test Color"]
+    preview_colors = {
+        MAT_BLACK: [20, 20, 20, 255],
+        MAT_WHITE: [255, 255, 255, 255],
+        MAT_TEST_COLOR: [0, 174, 214, 255]  # Cyan for preview
+    }
+    
+    meshes = []
+    
+    # 1. Generate Black Base (left half)
+    black_base = trimesh.creation.box(
+        extents=[step_width, card_length, base_z],
+        transform=trimesh.transformations.translation_matrix([step_width/2, card_length/2, base_z/2])
+    )
+    black_base.visual.face_colors = preview_colors[MAT_BLACK]
+    black_base.metadata['name'] = slot_names[MAT_BLACK]
+    meshes.append((black_base, slot_names[MAT_BLACK]))
+    
+    # 2. Generate White Base (right half)
+    white_base = trimesh.creation.box(
+        extents=[step_width, card_length, base_z],
+        transform=trimesh.transformations.translation_matrix([step_width + step_width/2, card_length/2, base_z/2])
+    )
+    white_base.visual.face_colors = preview_colors[MAT_WHITE]
+    white_base.metadata['name'] = slot_names[MAT_WHITE]
+    meshes.append((white_base, slot_names[MAT_WHITE]))
+    
+    # 3. Generate Test Color Steps (stacked on both bases)
+    test_color_meshes = []
+    for i in range(num_steps):
+        step_z = step_heights[i]
+        y_offset = i * step_length
+        
+        # Step on black base (left)
+        step_black = trimesh.creation.box(
+            extents=[step_width, step_length, step_z],
+            transform=trimesh.transformations.translation_matrix([step_width/2, y_offset + step_length/2, base_z + step_z/2])
+        )
+        test_color_meshes.append(step_black)
+        
+        # Step on white base (right)
+        step_white = trimesh.creation.box(
+            extents=[step_width, step_length, step_z],
+            transform=trimesh.transformations.translation_matrix([step_width + step_width/2, y_offset + step_length/2, base_z + step_z/2])
+        )
+        test_color_meshes.append(step_white)
+    
+    # Merge all test color steps into one mesh
+    test_color_combined = trimesh.util.concatenate(test_color_meshes)
+    test_color_combined.visual.face_colors = preview_colors[MAT_TEST_COLOR]
+    test_color_combined.metadata['name'] = slot_names[MAT_TEST_COLOR]
+    meshes.append((test_color_combined, slot_names[MAT_TEST_COLOR]))
+    
+    # Build 3MF scene
+    scene = trimesh.Scene()
+    for mesh, name in meshes:
+        scene.add_geometry(mesh, node_name=name, geom_name=name)
+    
+    # Export
+    output_path = os.path.join(OUTPUT_DIR, "Lumina_KS_Step_Card.3mf")
+    scene.export(output_path)
+    
+    safe_fix_3mf_names(output_path, slot_names)
+    
+    # Generate preview (top view)
+    preview_w, preview_h = 400, 600
+    preview_arr = np.zeros((preview_h, preview_w, 3), dtype=np.uint8)
+    
+    # Draw black base (left half)
+    preview_arr[:, :preview_w//2] = preview_colors[MAT_BLACK][:3]
+    
+    # Draw white base (right half)
+    preview_arr[:, preview_w//2:] = preview_colors[MAT_WHITE][:3]
+    
+    # Draw test color steps
+    for i in range(num_steps):
+        y_start = int((i * step_length / card_length) * preview_h)
+        y_end = int(((i + 1) * step_length / card_length) * preview_h)
+        preview_arr[y_start:y_end, :] = preview_colors[MAT_TEST_COLOR][:3]
+    
+    Stats.increment("calibrations")
+    
+    print(f"[K/S_STEP_CARD] ✅ Generated: {output_path}")
+    
+    return (
+        output_path,
+        Image.fromarray(preview_arr),
+        f"✅ K/S 阶梯卡生成完毕！\n"
+        f"📐 尺寸: {card_width}x{card_length}mm\n"
+        f"📊 阶梯数: {num_steps} (1-{num_steps}层)\n"
+        f"🎨 材质槽: {', '.join(slot_names)}\n"
+        f"💡 提示: 直接拖入切片软件，已预对齐！"
+    )

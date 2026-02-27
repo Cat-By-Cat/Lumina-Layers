@@ -491,9 +491,79 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
     # All K-Means, layer slicing, and mesh generation logic is unified.
     
     color_conf = ColorSystem.get(color_mode)
+    
+    # Auto 模式：先检测 LUT 的实际色彩模式
+    if color_mode == "Auto":
+        detected = detect_lut_color_mode(actual_lut_path)
+        if detected:
+            color_mode = detected
+            color_conf = ColorSystem.get(color_mode)
+
     slot_names = color_conf['slots']
     preview_colors = color_conf['preview']
     
+    # 尝试从 _meta.json 读取 K/S LUT 的实际耗材名，覆盖硬编码的 slot_names
+    try:
+        import json as _json
+        base_path, _ext = os.path.splitext(actual_lut_path)
+        meta_path = base_path + "_meta.json"
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf-8') as _mf:
+                lut_meta = _json.load(_mf)
+            filament_names = lut_meta.get('filament_names')
+            # === DEBUG: _meta.json 加载详情 ===
+            print(f"[DEBUG CONVERTER] meta_path: {meta_path}")
+            print(f"[DEBUG CONVERTER] filament_names from meta: {filament_names} (len={len(filament_names) if filament_names else 0})")
+            print(f"[DEBUG CONVERTER] slot_names from ColorSystem: {slot_names} (len={len(slot_names)})")
+            filament_colors_meta = lut_meta.get('filament_colors')
+            print(f"[DEBUG CONVERTER] filament_colors from meta: {filament_colors_meta} (len={len(filament_colors_meta) if filament_colors_meta else 0})")
+            print(f"[DEBUG CONVERTER] preview_colors from ColorSystem: len={len(preview_colors)}")
+            print(f"[DEBUG CONVERTER] color_mode={color_mode}, num_filaments(meta)={lut_meta.get('num_filaments')}")
+            # === END DEBUG ===
+            if filament_names and len(filament_names) == len(slot_names):
+                print(f"[CONVERTER] Using K/S filament names from metadata: {filament_names}")
+                slot_names = filament_names
+            elif filament_names:
+                print(f"[DEBUG CONVERTER] ⚠️ filament_names 长度不匹配! meta={len(filament_names)} vs slots={len(slot_names)}, 跳过覆盖")
+            # 从 metadata 读取耗材颜色，覆盖硬编码的 preview_colors
+            filament_colors = lut_meta.get('filament_colors')
+            if filament_colors and len(filament_colors) == len(preview_colors):
+                print(f"[CONVERTER] Using K/S filament colors from metadata: {filament_colors}")
+                for idx, hex_color in enumerate(filament_colors):
+                    try:
+                        hex_color = hex_color.lstrip('#')
+                        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+                        preview_colors[idx] = [r, g, b, 255]
+                    except (ValueError, IndexError):
+                        pass  # 保留原始颜色
+            elif filament_colors:
+                print(f"[DEBUG CONVERTER] ⚠️ filament_colors 长度不匹配! meta={len(filament_colors)} vs preview={len(preview_colors)}, 跳过覆盖")
+    except Exception as e:
+        print(f"[CONVERTER] Warning: Failed to read LUT metadata: {e}")
+
+    # K/S LUT 自动检测 backing 颜色：找到最接近白色的耗材
+    # 当用户没有手动指定 backing_color_id（默认=0）且有 _meta.json 时，
+    # 自动选择亮度最高的耗材作为 backing，避免 backing 和颜色层冲突
+    if backing_color_id == 0 and not separate_backing:
+        try:
+            if 'lut_meta' in dir() or 'lut_meta' in locals():
+                fc = lut_meta.get('filament_colors') if lut_meta else None
+                if fc and len(fc) == len(slot_names):
+                    best_idx = 0
+                    best_brightness = -1
+                    for i, hc in enumerate(fc):
+                        hc = hc.lstrip('#')
+                        r, g, b = int(hc[0:2], 16), int(hc[2:4], 16), int(hc[4:6], 16)
+                        brightness = r + g + b
+                        if brightness > best_brightness:
+                            best_brightness = brightness
+                            best_idx = i
+                    if best_idx != 0:
+                        print(f"[CONVERTER] K/S auto-detect: backing changed from mat_id=0 to mat_id={best_idx} ({slot_names[best_idx]}, brightness={best_brightness})")
+                        backing_color_id = best_idx
+        except Exception as e:
+            print(f"[CONVERTER] Warning: Auto-detect backing color failed: {e}")
+
     # Validate backing_color_id (allow -2 as special marker for separation)
     num_materials = len(slot_names)
     if backing_color_id != -2 and (backing_color_id < 0 or backing_color_id >= num_materials):
@@ -913,6 +983,8 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
         return None, None, None, "❌ Mesh generation failed: No valid meshes generated"
     
     try:
+        print(f"[DEBUG 3MF] scene.geometry.keys() 顺序: {list(scene.geometry.keys())}")
+        print(f"[DEBUG 3MF] valid_slot_names 顺序: {valid_slot_names}")
         scene.export(out_path)
         safe_fix_3mf_names(out_path, valid_slot_names)
         print(f"[CONVERTER] 3MF exported: {out_path}")
@@ -2011,6 +2083,14 @@ def generate_preview_cached(image_path, lut_path, target_width_mm,
     color_conf = ColorSystem.get(color_mode)
     
     try:
+        # Auto 模式：先检测 LUT 的实际色彩模式
+        if color_mode == "Auto":
+            detected = detect_lut_color_mode(actual_lut_path)
+            if detected:
+                color_mode = detected
+                color_conf = ColorSystem.get(color_mode)
+            # 未检测到时保持默认 fallback
+
         processor = LuminaImageProcessor(actual_lut_path, color_mode)
         processor.enable_cleanup = enable_cleanup
         result = processor.process_image(
@@ -3099,13 +3179,21 @@ def detect_lut_color_mode(lut_path):
         # Standard .npy format
         lut_data = np.load(lut_path)
         
-        # 确保是2D数组
+        # 确保是2D数组 (N, 3)
         if lut_data.ndim == 1:
-            # 如果是1D数组，假设是 (N*3,) 格式，重塑为 (N, 3)
             if len(lut_data) % 3 == 0:
                 lut_data = lut_data.reshape(-1, 3)
             else:
-                print(f"[AUTO_DETECT] Invalid LUT format: cannot reshape to (N, 3)")
+                print(f"[AUTO_DETECT] Invalid LUT format: size {lut_data.size} cannot reshape to (N, 3)")
+                return None
+        
+        # 处理 3D 数组（可能是 RGBA）
+        if lut_data.ndim == 3:
+            if lut_data.shape[2] == 4:
+                print(f"[AUTO_DETECT] RGBA format detected {lut_data.shape}, using RGB channels")
+                lut_data = lut_data[:, :, :3]
+            elif lut_data.shape[2] != 3:
+                print(f"[AUTO_DETECT] Invalid LUT format: last dim is {lut_data.shape[2]}, expected 3 or 4")
                 return None
         
         # 计算颜色数量
@@ -3116,19 +3204,31 @@ def detect_lut_color_mode(lut_path):
         
         print(f"[AUTO_DETECT] LUT shape: {lut_data.shape}, total colors: {total_colors}")
         
-        # 2色模式：32色 (2^5 = 32)
-        if total_colors >= 30 and total_colors <= 35:
-            print(f"[AUTO_DETECT] Detected 2-Color BW mode (32 colors)")
-            return "BW (Black & White)"
+        # 精确匹配 n^5 值 — 返回值必须匹配 Radio choices
+        # Radio choices: "BW (Black & White)", "4-Color", "6-Color (Smart 1296)", "8-Color Max", "Merged"
+        n5_map = {
+            32: ("BW (Black & White)", 2),
+            1024: ("4-Color", 4),
+            7776: ("6-Color (Smart 1296)", 6),
+            32768: ("8-Color Max", 8),
+            # 非标准 n^5 模式归为 Merged
+            243: ("Merged", 3),
+            3125: ("Merged", 5),
+            16807: ("Merged", 7),
+        }
         
-        # 8色模式：2600-2800色
-        elif total_colors >= 2600 and total_colors <= 2800:
-            print(f"[AUTO_DETECT] Detected 8-Color mode ({total_colors} colors)")
+        if total_colors in n5_map:
+            mode_str, n = n5_map[total_colors]
+            print(f"[AUTO_DETECT] Detected {n}-Color mode ({total_colors} colors)")
+            return mode_str
+        
+        # Smart 模式范围匹配（保留现有逻辑）
+        if total_colors >= 2600 and total_colors <= 2800:
+            print(f"[AUTO_DETECT] Detected 8-Color Max mode ({total_colors} colors)")
             return "8-Color Max"
         
-        # 6色模式：1200-1400色
-        elif total_colors >= 1200 and total_colors < 1400:
-            print(f"[AUTO_DETECT] Detected 6-Color mode ({total_colors} colors)")
+        if total_colors >= 1200 and total_colors < 1400:
+            print(f"[AUTO_DETECT] Detected 6-Color Smart mode ({total_colors} colors)")
             return "6-Color (Smart 1296)"
         
         # 4色模式：900-1200色

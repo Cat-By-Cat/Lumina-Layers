@@ -37,14 +37,95 @@ def on_lut_select(display_name):
 
 def on_lut_upload_save(uploaded_file):
     """
-    Save uploaded LUT file (auto-save, no custom name needed)
-    
+    Save uploaded LUT file (.npy or .zip bundle) with auto-extraction.
+
+    Supports:
+    - .npy: Single LUT file (legacy behavior)
+    - .zip: Bundle containing .npy + optional _stacks.npy + optional _meta.json
+
+    Args:
+        uploaded_file: Gradio 上传的文件对象
+
     Returns:
         tuple: (new_dropdown, status_message)
     """
-    success, message, new_choices = LUTManager.save_uploaded_lut(uploaded_file, custom_name=None)
+    import zipfile as _zipfile
+    import tempfile
+
+    if uploaded_file is None:
+        return gr.Dropdown(choices=LUTManager.get_lut_choices()), "❌ No file selected"
+
+    file_path = uploaded_file.name if hasattr(uploaded_file, 'name') else str(uploaded_file)
+
+    # ZIP 文件：自动解包
+    if file_path.lower().endswith('.zip'):
+        try:
+            with _zipfile.ZipFile(file_path, 'r') as zf:
+                names = zf.namelist()
+                # 找到主 LUT .npy 文件（不含 _stacks）
+                lut_files = [n for n in names if n.endswith('.npy') and '_stacks' not in n]
+                if not lut_files:
+                    return gr.Dropdown(choices=LUTManager.get_lut_choices()), "❌ ZIP 中未找到 .npy LUT 文件"
+
+                lut_name = lut_files[0]
+                base_stem = lut_name.rsplit('.', 1)[0]  # e.g. "AAAAAAAA_KS"
+
+                # 解压到临时目录
+                tmp_dir = tempfile.mkdtemp()
+                zf.extractall(tmp_dir)
+
+                # 构建文件路径
+                import os
+                lut_tmp = os.path.join(tmp_dir, lut_name)
+
+                stacks_name = base_stem + "_stacks.npy"
+                stacks_tmp = os.path.join(tmp_dir, stacks_name) if stacks_name in names else None
+
+                meta_name = base_stem + "_meta.json"
+                meta_tmp = os.path.join(tmp_dir, meta_name) if meta_name in names else None
+
+                # 创建临时文件对象模拟 Gradio 上传
+                class _TmpFile:
+                    def __init__(self, path):
+                        self.name = path
+
+                stacks_file = _TmpFile(stacks_tmp) if stacks_tmp and os.path.exists(stacks_tmp) else None
+                meta_file = _TmpFile(meta_tmp) if meta_tmp and os.path.exists(meta_tmp) else None
+
+                success, message, new_choices, saved_name = LUTManager.save_uploaded_lut(
+                    _TmpFile(lut_tmp), stacks_file=stacks_file, meta_file=meta_file, custom_name=None
+                )
+
+                # 清理临时目录
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+                return gr.Dropdown(choices=new_choices, value=saved_name), message
+
+        except _zipfile.BadZipFile:
+            return gr.Dropdown(choices=LUTManager.get_lut_choices()), "❌ 无效的 ZIP 文件"
+        except Exception as e:
+            return gr.Dropdown(choices=LUTManager.get_lut_choices()), f"❌ ZIP 解包失败: {e}"
+
+    # 普通 .npy 文件：直接保存
+    success, message, new_choices, saved_name = LUTManager.save_uploaded_lut(
+        uploaded_file, custom_name=None
+    )
+    return gr.Dropdown(choices=new_choices, value=saved_name), message
+
+
+
+def on_stacks_only_upload(stacks_file):
+    """
+    当用户仅上传 stacks 文件（未上传 LUT）时返回提示信息
     
-    return gr.Dropdown(choices=new_choices), message
+    Args:
+        stacks_file: Gradio 上传的 stacks 文件对象
+    
+    Returns:
+        str: 提示用户先上传 LUT 文件的状态消息
+    """
+    return "⚠️ 请先上传 LUT 文件，再上传 Stacks 文件"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -53,6 +134,9 @@ def on_lut_upload_save(uploaded_file):
 
 def get_first_hint(mode):
     """Get first corner point hint based on mode"""
+    if mode == "K/S Parameter":
+        return "#### 👉 步骤 1/2: 点击 A4纸/背景板 **左上角 / Top-Left**"
+    
     conf = ColorSystem.get(mode)
     label_zh = conf['corner_labels'][0]
     label_en = conf.get('corner_labels_en', conf['corner_labels'])[0]
@@ -61,6 +145,21 @@ def get_first_hint(mode):
 
 def get_next_hint(mode, pts_count):
     """Get next corner point hint based on mode"""
+    if mode == "K/S Parameter":
+        # K/S mode needs 8 points total (4 for A4, 4 for chip)
+        if pts_count < 4:
+            labels = ["左上角 / Top-Left", "右上角 / Top-Right", "右下角 / Bottom-Right", "左下角 / Bottom-Left"]
+            return f"#### 👉 步骤 1/2 (A4纸/背景板): 点击 **{labels[pts_count]}**"
+        elif pts_count == 4:
+            return "#### ✅ A4纸/背景板定位完成！图像已自动校正\n#### 👉 步骤 2/2: 在校正后的图像上点击阶梯卡 **左上角 / Top-Left**\n⚠️ 确保上方是厚端(5层)，下方是薄端(1层)"
+        elif pts_count < 8:
+            labels = ["左上角 / Top-Left", "右上角 / Top-Right", "右下角 / Bottom-Right", "左下角 / Bottom-Left"]
+            chip_idx = pts_count - 4
+            return f"#### 👉 步骤 2/2 (阶梯卡): 点击 **{labels[chip_idx]}**"
+        else:
+            return "#### ✅ 定位完成！可以开始提取 K/S 参数！"
+    
+    # Standard modes
     conf = ColorSystem.get(mode)
     if pts_count >= 4:
         return "#### ✅ Positioning complete! Ready to extract!"
@@ -72,6 +171,10 @@ def get_next_hint(mode, pts_count):
 def on_extractor_upload(i, mode):
     """Handle image upload"""
     hint = get_first_hint(mode)
+    print(f"[K/S DEBUG] on_extractor_upload: type={type(i).__name__}, {'shape='+str(i.shape)+' dtype='+str(i.dtype) if hasattr(i, 'shape') else 'value='+str(i)[:80]}")
+    if hasattr(i, 'shape') and len(i.shape) == 3:
+        print(f"[K/S DEBUG] upload pixel[0,0]: {i[0,0]}")
+    # Return: state_img, original_img, pts, curr_coord, hint
     return i, i, [], None, hint
 
 
@@ -90,15 +193,161 @@ def on_extractor_rotate(i, mode):
     return r, r, [], get_first_hint(mode)
 
 
-def on_extractor_click(img, pts, mode, evt: gr.SelectData):
-    """Set corner point by clicking image"""
+def on_extractor_click(img, original_img, pts, mode, evt: gr.SelectData):
+    """Set corner point by clicking image
+    
+    Returns:
+        tuple: (state_img, original_img, work_img, pts, hint)
+            - state_img: The base image for next click (updated when switching to corrected A4)
+            - original_img: Always keeps the original uploaded image (for K/S extraction)
+            - work_img: The display image with markers
+            - pts: Updated points list
+            - hint: Hint text for next step
+    """
     from core.extractor import draw_corner_points
-    if len(pts) >= 4:
-        return img, pts, "#### ✅ 定位完成 Complete!"
+    
+    # Debug: log input types and shapes
+    print(f"[K/S DEBUG] on_extractor_click called")
+    print(f"[K/S DEBUG] img type={type(img).__name__}, {'shape='+str(img.shape)+' dtype='+str(img.dtype) if hasattr(img, 'shape') else 'value='+str(img)[:80]}")
+    print(f"[K/S DEBUG] original_img type={type(original_img).__name__}, {'shape='+str(original_img.shape)+' dtype='+str(original_img.dtype) if hasattr(original_img, 'shape') else 'value='+str(original_img)[:80]}")
+    print(f"[K/S DEBUG] mode={mode}, pts count={len(pts)}")
+    
+    # K/S mode needs 8 points, standard modes need 4
+    max_points = 8 if mode == "K/S Parameter" else 4
+    
+    if len(pts) >= max_points:
+        return img, original_img, img, pts, get_next_hint(mode, len(pts))
+    
     n = pts + [[evt.index[0], evt.index[1]]]
-    vis = draw_corner_points(img, n, mode)
-    hint = get_next_hint(mode, len(n))
-    return vis, n, hint
+    print(f"[K/S DEBUG] New point: [{evt.index[0]}, {evt.index[1]}], total points: {len(n)}")
+    
+    # For K/S mode, handle two-step process
+    if mode == "K/S Parameter":
+        if len(n) <= 4:
+            # Step 1: Selecting A4 corners on original image
+            vis = draw_ks_corner_points(img, n, mode='a4')
+            hint = get_next_hint(mode, len(n))
+            
+            # If we just completed A4 selection (4 points), show corrected A4 image
+            if len(n) == 4:
+                try:
+                    import cv2
+                    import numpy as np
+                    from core.ks_engine.calibration_ks import apply_perspective_transform, auto_white_balance_by_paper
+                    
+                    # Gradio Image (type="numpy") provides RGB, OpenCV needs BGR
+                    if isinstance(original_img, str):
+                        img_raw = cv2.imread(original_img)
+                        print(f"[K/S DEBUG] Loaded original from path: {original_img}")
+                    else:
+                        img_raw = cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR)
+                        print(f"[K/S DEBUG] Converted original RGB->BGR, shape={img_raw.shape}")
+                    
+                    print(f"[K/S DEBUG] img_raw pixel[0,0] BGR: {img_raw[0,0]}")
+                    
+                    # Apply perspective transform to A4
+                    a4_pts = np.float32(n)
+                    print(f"[K/S DEBUG] A4 corners: {a4_pts.tolist()}")
+                    img_a4 = apply_perspective_transform(img_raw, a4_pts, 1414, 1000)
+                    print(f"[K/S DEBUG] img_a4 shape={img_a4.shape}, pixel[0,0] BGR: {img_a4[0,0]}")
+                    
+                    # Apply white balance
+                    img_calibrated = auto_white_balance_by_paper(img_a4, enable_wb=True)
+                    print(f"[K/S DEBUG] img_calibrated shape={img_calibrated.shape}, pixel[0,0] BGR: {img_calibrated[0,0]}")
+                    
+                    # Save corrected A4 image for chip selection (BGR format for file)
+                    import os
+                    temp_dir = "output/ks_engine/debug"
+                    os.makedirs(temp_dir, exist_ok=True)
+                    a4_corrected_path = os.path.join(temp_dir, "a4_corrected_for_selection.jpg")
+                    cv2.imwrite(a4_corrected_path, img_calibrated)
+                    
+                    # Convert BGR -> RGB for Gradio display
+                    img_calibrated_rgb = cv2.cvtColor(img_calibrated, cv2.COLOR_BGR2RGB)
+                    
+                    print(f"[K/S DEBUG] A4 corrected saved to: {a4_corrected_path}")
+                    print(f"[K/S DEBUG] Returning RGB numpy array for state_img and work_img")
+                    print(f"[K/S DEBUG] img_calibrated_rgb pixel[0,0] RGB: {img_calibrated_rgb[0,0]}")
+                    
+                    # Return RGB numpy array for Gradio, keep original_img unchanged
+                    return img_calibrated_rgb, original_img, img_calibrated_rgb, n, hint
+                except Exception as e:
+                    print(f"Error generating A4 corrected image: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Return: state unchanged, original unchanged, work with markers
+            print(f"[K/S DEBUG] Returning vis type={type(vis).__name__}")
+            return img, original_img, vis, n, hint
+        else:
+            # Step 2: Selecting chip corners on corrected A4 image
+            print(f"[K/S DEBUG] Step 2: chip selection, img type={type(img).__name__}")
+            vis = draw_ks_corner_points(img, n[4:], mode='chip')
+            hint = get_next_hint(mode, len(n))
+            return img, original_img, vis, n, hint
+    else:
+        # Standard modes
+        vis = draw_corner_points(img, n, mode)
+        hint = get_next_hint(mode, len(n))
+        return img, original_img, vis, n, hint
+
+
+def draw_ks_corner_points(img_path, pts, mode='a4'):
+    """Draw corner points for K/S mode
+    
+    Args:
+        img_path: Image path or array
+        pts: List of points to draw
+        mode: 'a4' for A4 paper points (green), 'chip' for chip points (red)
+    """
+    import cv2
+    import numpy as np
+    
+    print(f"[K/S DEBUG] draw_ks_corner_points: input type={type(img_path).__name__}, mode={mode}")
+    if isinstance(img_path, str):
+        img = cv2.imread(img_path)
+        if img is not None:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # Convert to RGB for Gradio
+    else:
+        img = img_path.copy()  # Already RGB from Gradio
+    if img is None:
+        print(f"[K/S DEBUG] draw_ks_corner_points: img is None!")
+        return img_path
+    
+    print(f"[K/S DEBUG] draw_ks_corner_points: img shape={img.shape}, dtype={img.dtype}, pixel[0,0]={img[0,0]}")
+    
+    if mode == 'a4':
+        # Drawing A4 points (green, large markers) - RGB colors for Gradio
+        color = (0, 255, 0)
+        marker_size = 30
+        circle_size = 15
+        font_scale = 1.2
+    else:  # mode == 'chip'
+        # Drawing chip points (red, smaller markers) - RGB colors for Gradio
+        color = (255, 0, 0)
+        marker_size = 20
+        circle_size = 10
+        font_scale = 0.8
+    
+    for i, (x, y) in enumerate(pts):
+        # Draw cross marker
+        cv2.drawMarker(img, (x, y), color, cv2.MARKER_CROSS, marker_size, 3)
+        # Draw circle
+        cv2.circle(img, (x, y), circle_size, color, 3)
+        # Draw label
+        label = str(i + 1)
+        cv2.putText(
+            img, label,
+            (x + 20, y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 3
+        )
+    
+    # Draw polylines if we have 4 points
+    if len(pts) == 4:
+        pts_array = np.array(pts, dtype=np.int32)
+        cv2.polylines(img, [pts_array], True, color, 3)
+    
+    return img
 
 
 def on_extractor_clear(img, mode):
