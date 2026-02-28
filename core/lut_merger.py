@@ -61,7 +61,8 @@ _REMAP_TO_8COLOR = {
     "BW": {0: 0, 1: 4},           # White→White, Black→Black
     "4-Color-RYBW": {0: 0, 1: 5, 2: 3, 3: 6},  # White→White, Red→Red, Yellow→Yellow, Blue→DeepBlue
     "4-Color-CMYW": {0: 0, 1: 1, 2: 2, 3: 3},   # White→White, Cyan→Cyan, Magenta→Magenta, Yellow→Yellow
-    "6-Color": {0: 0, 1: 1, 2: 2, 3: 7, 4: 3, 5: 4},  # White→White, Cyan→Cyan, Magenta→Magenta, Green→Green, Yellow→Yellow, Black→Black
+    "6-Color-CMYWGK": {0: 0, 1: 1, 2: 2, 3: 7, 4: 3, 5: 4},  # White→White, Cyan→Cyan, Magenta→Magenta, Green→Green, Yellow→Yellow, Black→Black
+    "6-Color-RYBWGK": {0: 0, 1: 5, 2: 6, 3: 7, 4: 3, 5: 4},  # White→White, Red→Red, Blue→DeepBlue, Green→Green, Yellow→Yellow, Black→Black
 }
 
 
@@ -77,6 +78,18 @@ def _detect_4color_subtype(lut_path):
     return "4-Color-RYBW"
 
 
+def _detect_6color_subtype(lut_path):
+    """Detect 6-Color subtype (CMYWGK or RYBWGK) from filename.
+
+    Naming convention: filename containing 'RYBW' → RYBWGK, 'CMYW' → CMYWGK.
+    Default: CMYWGK (most common for 6-color).
+    """
+    basename = os.path.basename(lut_path).upper()
+    if "RYBW" in basename:
+        return "6-Color-RYBWGK"
+    return "6-Color-CMYWGK"
+
+
 def _remap_stacks(stacks, color_mode, lut_path=None):
     """Remap material IDs in stacks from source mode to 8-Color space.
 
@@ -87,7 +100,7 @@ def _remap_stacks(stacks, color_mode, lut_path=None):
     Args:
         stacks: numpy array (N, 5) of material IDs
         color_mode: source color mode string
-        lut_path: optional file path, used to detect 4-Color subtype
+        lut_path: optional file path, used to detect 4-Color/6-Color subtype
 
     Returns:
         numpy array (N, 5) with remapped material IDs
@@ -98,6 +111,8 @@ def _remap_stacks(stacks, color_mode, lut_path=None):
     remap_key = color_mode
     if color_mode == "4-Color" and lut_path:
         remap_key = _detect_4color_subtype(lut_path)
+    elif color_mode == "6-Color" and lut_path:
+        remap_key = _detect_6color_subtype(lut_path)
 
     remap = _REMAP_TO_8COLOR.get(remap_key)
     if remap is None:

@@ -1,7 +1,6 @@
 """
 Lumina Studio - 高度图浮雕模式单元测试
-
-测试 HeightmapLoader 的灰度映射、彩色图转灰度、尺寸缩放、
+测试 HeightmapLoader 的灰度映射、彩色图转灰度、尺寸缩放，
 以及 _build_relief_voxel_matrix 的高度钳制逻辑和错误处理。
 """
 
@@ -67,7 +66,6 @@ class TestColorToGrayscale:
 
     def test_rgb_image_converts_to_grayscale(self):
         """验证 RGB 图像正确转换为灰度"""
-        # 创建一个简单的 BGR 图像（cv2 默认格式）
         bgr_image = np.zeros((10, 10, 3), dtype=np.uint8)
         bgr_image[:, :, 0] = 100  # B
         bgr_image[:, :, 1] = 150  # G
@@ -78,17 +76,15 @@ class TestColorToGrayscale:
         assert result.ndim == 2
         assert result.shape == (10, 10)
         assert result.dtype == np.uint8
-        # 灰度值应该是 BGR 加权平均，不应全为 0
         assert np.mean(result) > 0
 
     def test_rgba_image_converts_to_grayscale(self):
         """验证 RGBA 图像正确处理 alpha 通道"""
-        # 创建 RGBA 图像
         rgba_image = np.zeros((10, 10, 4), dtype=np.uint8)
-        rgba_image[:, :, 0] = 100  # R (在 RGBA 格式中)
+        rgba_image[:, :, 0] = 100  # R
         rgba_image[:, :, 1] = 150  # G
         rgba_image[:, :, 2] = 200  # B
-        rgba_image[:, :, 3] = 255  # A (完全不透明)
+        rgba_image[:, :, 3] = 255  # A
 
         result = HeightmapLoader._to_grayscale(rgba_image)
 
@@ -152,7 +148,6 @@ class TestHeightClamping:
         """验证高度值小于 OPTICAL_LAYERS 厚度（0.4mm）时被钳制为最小值"""
         from core.converter import _build_relief_voxel_matrix
 
-        # 创建一个 3x3 的简单场景
         h, w = 3, 3
         matched_rgb = np.full((h, w, 3), 128, dtype=np.uint8)
         material_matrix = np.zeros((h, w, 5), dtype=int)
@@ -215,22 +210,17 @@ class TestErrorHandling:
 
     def test_aspect_ratio_deviation_warning(self):
         """验证宽高比偏差超过 20% 时返回警告 (需求 8.2)"""
-        # 高度图 100x50 (ratio=2.0), 目标 100x100 (ratio=1.0)
-        # 偏差 = |2.0 - 1.0| / 1.0 = 1.0 = 100% > 20%
         warning = HeightmapLoader._check_aspect_ratio(100, 50, 100, 100)
         assert warning is not None
         assert "⚠️" in warning
 
     def test_aspect_ratio_no_warning_when_close(self):
         """验证宽高比偏差小于 20% 时不返回警告"""
-        # 高度图 100x100 (ratio=1.0), 目标 110x100 (ratio=1.1)
-        # 偏差 = |1.0 - 1.1| / 1.1 ≈ 0.09 = 9% < 20%
         warning = HeightmapLoader._check_aspect_ratio(100, 100, 110, 100)
         assert warning is None
 
     def test_low_contrast_warning(self):
         """验证低对比度（标准差 < 1.0）时返回警告 (需求 8.3)"""
-        # 全黑图，标准差 = 0
         grayscale = np.zeros((10, 10), dtype=np.uint8)
         warning = HeightmapLoader._check_contrast(grayscale)
         assert warning is not None
@@ -238,7 +228,6 @@ class TestErrorHandling:
 
     def test_no_contrast_warning_for_normal_image(self):
         """验证正常对比度图像不返回警告"""
-        # 创建有足够对比度的图像
         grayscale = np.zeros((10, 10), dtype=np.uint8)
         grayscale[:5, :] = 0
         grayscale[5:, :] = 255

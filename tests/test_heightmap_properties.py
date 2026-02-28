@@ -42,14 +42,11 @@ OPTICAL_THICKNESS_MM = OPTICAL_LAYERS * LAYER_HEIGHT  # 0.4mm
 )
 def test_grayscale_mapping_formula(grayscale_val, max_relief_height, base_thickness):
     """Property 1: 灰度映射公式正确性
-
     对于任意灰度值 g ∈ [0, 255]、任意 max_relief_height > base_thickness，
     _map_grayscale_to_height 的输出应满足公式和值域约束。
     """
-    # 前置条件：max_relief_height 必须大于 base_thickness
     assume(max_relief_height > base_thickness)
 
-    # 构造单像素灰度数组
     grayscale = np.array([[grayscale_val]], dtype=np.uint8)
     result = HeightmapLoader._map_grayscale_to_height(grayscale, max_relief_height, base_thickness)
 
@@ -71,15 +68,11 @@ def test_grayscale_mapping_formula(grayscale_val, max_relief_height, base_thickn
 
     # 验证边界条件：g=0 → max_relief_height
     if grayscale_val == 0:
-        assert np.isclose(height_mm, max_relief_height, atol=1e-4), (
-            f"g=0 时应输出 max_relief_height={max_relief_height}, got {height_mm}"
-        )
+        assert np.isclose(height_mm, max_relief_height, atol=1e-4)
 
     # 验证边界条件：g=255 → base_thickness
     if grayscale_val == 255:
-        assert np.isclose(height_mm, base_thickness, atol=1e-4), (
-            f"g=255 时应输出 base_thickness={base_thickness}, got {height_mm}"
-        )
+        assert np.isclose(height_mm, base_thickness, atol=1e-4)
 
 
 # ============================================================================
@@ -110,7 +103,6 @@ def test_height_matrix_shape_and_type(
     """
     assume(max_relief_height > base_thickness)
 
-    # 生成随机图像并保存为临时文件
     if channels == 1:
         img = np.random.randint(0, 256, (img_h, img_w), dtype=np.uint8)
     else:
@@ -133,15 +125,10 @@ def test_height_matrix_shape_and_type(
 
         hm = result["height_matrix"]
 
-        # 验证形状
         assert hm.shape == (target_h, target_w), (
             f"形状不匹配: got {hm.shape}, expected ({target_h}, {target_w})"
         )
-
-        # 验证数据类型
-        assert hm.dtype == np.float32, f"dtype 不匹配: got {hm.dtype}, expected float32"
-
-        # 验证值域
+        assert hm.dtype == np.float32, f"dtype 不匹配: got {hm.dtype}"
         assert np.all(hm >= base_thickness - 1e-4), (
             f"存在值低于 base_thickness: min={np.min(hm)}"
         )
@@ -174,21 +161,16 @@ def test_voxel_matrix_structure(size, max_height, backing_color_id):
 
     target_h, target_w = size, size
 
-    # 生成随机 height_matrix（值域 [OPTICAL_THICKNESS_MM, max_height]）
     assume(max_height >= OPTICAL_THICKNESS_MM)
     height_matrix = np.random.uniform(
         OPTICAL_THICKNESS_MM, max_height, (target_h, target_w)
     ).astype(np.float32)
 
-    # 生成随机 mask_solid（至少有一个实心像素）
     mask_solid = np.random.choice([True, False], (target_h, target_w))
     if not np.any(mask_solid):
         mask_solid[0, 0] = True
 
-    # 生成随机 material_matrix (H, W, 5)，值域 [0, 3]
     material_matrix = np.random.randint(0, 4, (target_h, target_w, OPTICAL_LAYERS), dtype=int)
-
-    # 生成随机 matched_rgb
     matched_rgb = np.random.randint(0, 256, (target_h, target_w, 3), dtype=np.uint8)
 
     full_matrix, backing_metadata = _build_relief_voxel_matrix(
@@ -215,19 +197,16 @@ def test_voxel_matrix_structure(size, max_height, backing_color_id):
     for y in range(target_h):
         for x in range(target_w):
             if not mask_solid[y, x]:
-                # 非实心像素：所有层 = -1
                 col = full_matrix[:, y, x]
                 assert np.all(col == -1), (
                     f"非实心像素 ({y},{x}) 存在非 -1 值: {col[col != -1]}"
                 )
             else:
-                # 实心像素：验证总层数和材料分配
                 pixel_height = height_matrix[y, x]
                 clamped_height = max(pixel_height, OPTICAL_THICKNESS_MM)
                 expected_layers = max(OPTICAL_LAYERS, int(math.ceil(clamped_height / LAYER_HEIGHT)))
                 expected_layers = min(expected_layers, max_z_layers)
 
-                # 光学层起始位置
                 optical_start = expected_layers - OPTICAL_LAYERS
 
                 # 验证基座层（backing）
@@ -274,11 +253,9 @@ def test_mode_priority(use_heightmap, enable_relief, has_color_height_map):
     - heightmap_path 为 None 且 enable_relief=True → color_height_map 模式
     - enable_relief=False → 标准平面模式
     """
-    # 模拟参数
     heightmap_path = "/fake/heightmap.png" if use_heightmap else None
     color_height_map = {"#ff0000": 3.0} if has_color_height_map else None
 
-    # 直接测试优先级决策逻辑（与 convert_image_to_3d Step 5 一致）
     use_heightmap_mode = False
     use_color_height_mode = False
     use_flat_mode = False
@@ -286,7 +263,6 @@ def test_mode_priority(use_heightmap, enable_relief, has_color_height_map):
     # 模拟 convert_image_to_3d 中的优先级逻辑
     heightmap_height_matrix = None
     if heightmap_path is not None and enable_relief:
-        # 高度图模式：模拟 load_and_process 成功
         heightmap_height_matrix = np.ones((4, 4), dtype=np.float32)
 
     if heightmap_height_matrix is not None:
@@ -296,28 +272,19 @@ def test_mode_priority(use_heightmap, enable_relief, has_color_height_map):
     else:
         use_flat_mode = True
 
-    # 验证优先级
     if use_heightmap and enable_relief:
-        assert use_heightmap_mode, (
-            "heightmap_path 不为 None 且 enable_relief=True 时应使用高度图模式"
-        )
-        assert not use_color_height_mode, "高度图模式下不应使用 color_height_map 模式"
-        assert not use_flat_mode, "高度图模式下不应使用平面模式"
-
+        assert use_heightmap_mode
+        assert not use_color_height_mode
+        assert not use_flat_mode
     elif not use_heightmap and enable_relief and has_color_height_map:
-        assert use_color_height_mode, (
-            "heightmap_path 为 None 且 enable_relief=True 时应回退到 color_height_map 模式"
-        )
-        assert not use_heightmap_mode, "回退模式下不应使用高度图模式"
-
+        assert use_color_height_mode
+        assert not use_heightmap_mode
     elif not enable_relief:
-        assert use_flat_mode, "enable_relief=False 时应使用标准平面模式"
+        assert use_flat_mode
 
-    # 额外验证：高度图模式优先于 color_height_map
+    # 高度图模式优先于 color_height_map
     if use_heightmap and enable_relief and has_color_height_map:
-        assert use_heightmap_mode and not use_color_height_mode, (
-            "高度图模式应优先于 color_height_map 模式"
-        )
+        assert use_heightmap_mode and not use_color_height_mode
 
 
 # ============================================================================
@@ -366,7 +333,6 @@ def test_contrast_warning(size, fill_value):
 
     当灰度值标准差 < 1.0 时，_check_contrast 应返回非 None 的警告字符串。
     """
-    # 生成均匀灰度图（标准差 = 0）
     grayscale = np.full((size, size), fill_value, dtype=np.uint8)
     result = HeightmapLoader._check_contrast(grayscale)
 
@@ -386,7 +352,6 @@ def test_contrast_no_warning_for_varied_image(size):
 
     当灰度值标准差 >= 1.0 时，_check_contrast 应返回 None。
     """
-    # 生成有明显对比度的图像（一半黑一半白）
     grayscale = np.zeros((size, size), dtype=np.uint8)
     half = size // 2
     grayscale[:half, :] = 0
@@ -425,10 +390,10 @@ def test_invalid_file_error_handling(random_bytes):
         result = HeightmapLoader.load_and_validate(tmp_path)
 
         assert result["success"] is False, (
-            f"随机字节文件应返回 success=False, got True"
+            "随机字节文件应返回 success=False"
         )
         assert result["error"] is not None and len(result["error"]) > 0, (
-            f"随机字节文件应返回非空 error 信息"
+            "随机字节文件应返回非空 error 信息"
         )
     finally:
         os.unlink(tmp_path)

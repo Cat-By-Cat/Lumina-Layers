@@ -29,15 +29,14 @@ class LuminaImageProcessor:
     
     Handles LUT loading, image processing, and color matching.
     """
-    
+
     @staticmethod
     def _rgb_to_lab(rgb_array):
-        """
-        将 RGB 数组转换为 CIELAB 空间（感知均匀色彩空间）。
-        
+        """将 RGB 数组转换为 CIELAB 空间（感知均匀色彩空间）。
+
         Args:
             rgb_array: numpy array, shape (N, 3) 或 (H, W, 3), dtype uint8
-        
+
         Returns:
             numpy array, 同 shape, dtype float64, Lab 值
         """
@@ -46,11 +45,8 @@ class LuminaImageProcessor:
             rgb_3d = rgb_array.reshape(1, -1, 3).astype(np.uint8)
         else:
             rgb_3d = rgb_array.astype(np.uint8)
-        
-        # OpenCV 使用 BGR 顺序
         bgr = cv2.cvtColor(rgb_3d, cv2.COLOR_RGB2BGR)
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2Lab).astype(np.float64)
-        
         if len(original_shape) == 2:
             return lab.reshape(original_shape)
         return lab

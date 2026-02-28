@@ -1946,7 +1946,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             
             # Relief height slider (only visible when relief mode is enabled and a color is selected)
             components['slider_conv_relief_height'] = gr.Slider(
-                minimum=1.0,
+                minimum=0.08,
                 maximum=20.0,
                 value=1.2,
                 step=0.1,
@@ -1958,7 +1958,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             # Max relief height slider - extracted outside Accordion so it remains visible
             # when heightmap mode hides the Accordion (shared by both auto-height and heightmap modes)
             components['slider_conv_auto_height_max'] = gr.Slider(
-                minimum=2.0,
+                minimum=0.08,
                 maximum=15.0,
                 value=5.0,
                 step=0.1,
@@ -1966,7 +1966,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 info="所有颜色的最大高度（相对于底板）",
                 visible=False
             )
-
+            
             # Auto Height Generator (only visible when relief mode is enabled)
             with gr.Accordion(label="⚡ 高度生成器 | Height Generator", open=True, visible=False) as conv_auto_height_accordion:
                 components['radio_conv_auto_height_mode'] = gr.Radio(
@@ -1984,7 +1984,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                     "✨ 一键生成高度 | Apply Auto Heights",
                     variant="primary"
                 )
-
+                
                 # ========== Heightmap Upload Components (inside accordion) ==========
                 with gr.Row(visible=False) as conv_heightmap_row:
                     components['image_conv_heightmap'] = gr.Image(
@@ -3060,7 +3060,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         - slider_conv_relief_height
         - accordion_conv_auto_height
         - slider_conv_auto_height_max
-        - row_conv_heightmap (heightmap upload row)
+        - row_conv_heightmap
         - image_conv_heightmap_preview
         - conv_color_height_map
         - conv_relief_selected_color
@@ -3149,13 +3149,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
 
     # ========== Sorting Rule Radio Change Handler ==========
     def on_height_mode_change(mode):
-        """切换排列规则时，控制高度图上传区和一键生成按钮的显隐。
-        
-        Returns updates for:
-        - row_conv_heightmap
-        - btn_conv_auto_height_apply
-        - image_conv_heightmap_preview
-        """
+        """切换排列规则时，控制高度图上传区和一键生成按钮的显隐。"""
         if mode == "根据高度图":
             return (
                 gr.update(visible=True),    # row_conv_heightmap - 显示高度图上传区
@@ -3181,12 +3175,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
 
     # ========== Heightmap Upload/Clear Handlers ==========
     def on_heightmap_upload(heightmap_path):
-        """高度图上传回调 - 验证并显示预览。
-        
-        Returns updates for:
-        - image_conv_heightmap_preview
-        - textbox_conv_status
-        """
+        """高度图上传回调 - 验证并显示预览。"""
         if not heightmap_path:
             return on_heightmap_clear()
         
@@ -3200,27 +3189,21 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             for warn in result['warnings']:
                 status_parts.append(warn)
             status_msg = " | ".join(status_parts)
-            
             return (
-                gr.update(visible=True, value=result['thumbnail']),  # 显示预览
-                status_msg                  # 状态栏
+                gr.update(visible=True, value=result['thumbnail']),
+                status_msg
             )
         else:
             return (
-                gr.update(visible=False),   # 隐藏预览
-                result['error']             # 状态栏显示错误
+                gr.update(visible=False),
+                result['error']
             )
     
     def on_heightmap_clear():
-        """高度图移除回调 - 清除预览。
-        
-        Returns updates for:
-        - image_conv_heightmap_preview
-        - textbox_conv_status
-        """
+        """高度图移除回调 - 清除预览。"""
         return (
-            gr.update(visible=False, value=None),  # 隐藏预览
-            ""                          # 清空状态栏
+            gr.update(visible=False, value=None),
+            ""
         )
     
     components['image_conv_heightmap'].change(

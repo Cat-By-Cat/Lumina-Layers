@@ -714,7 +714,7 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
                 matched_rgb=matched_rgb,
                 material_matrix=material_matrix,
                 mask_solid=mask_solid,
-                color_height_map=color_height_map,
+                color_height_map=color_height_map if color_height_map else {},
                 default_height=spacer_thick,
                 structure_mode=structure_mode,
                 backing_color_id=backing_color_id,
@@ -1183,14 +1183,27 @@ def _generate_outline_mesh(mask_solid, pixel_scale, outline_width_mm, outline_th
     
     print(f"[OUTLINE] Width: {outline_width_mm}mm = {outline_width_px}px, Thickness: {outline_thickness_mm}mm = {outline_layers} layers")
     
-    # Dilate the mask outward
-    kernel = np.ones((3, 3), np.uint8)
+    # [FIX] Pad the mask before dilation so edges touching image boundaries
+    # can still expand outward. Without padding, cv2.dilate treats the border
+    # as zeros and the outline ring is missing on boundary-touching sides.
+    pad = outline_width_px + 1
     mask_uint8 = mask_solid.astype(np.uint8) * 255
-    dilated = cv2.dilate(mask_uint8, kernel, iterations=outline_width_px)
-    dilated_mask = dilated > 0
+    padded_mask = cv2.copyMakeBorder(mask_uint8, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
     
-    # Ring = dilated minus original
-    ring_mask = dilated_mask & ~mask_solid
+    # Dilate the padded mask outward
+    kernel = np.ones((3, 3), np.uint8)
+    dilated = cv2.dilate(padded_mask, kernel, iterations=outline_width_px)
+    
+    # Also pad the original mask for subtraction
+    padded_original = cv2.copyMakeBorder(mask_uint8, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    
+    # Ring = dilated minus original (in padded space, preserving outline beyond image edges)
+    ring_mask = (dilated > 0) & ~(padded_original > 0)
+    
+    # Use padded dimensions for mesh generation; offset coordinates by -pad later
+    h, w = ring_mask.shape
+    # h_original is needed for Y-flip coordinate conversion
+    h_original = mask_solid.shape[0]
     
     if not np.any(ring_mask):
         print(f"[OUTLINE] Ring mask is empty, skipping")
@@ -1200,7 +1213,7 @@ def _generate_outline_mesh(mask_solid, pixel_scale, outline_width_mm, outline_th
     print(f"[OUTLINE] Ring mask: {ring_pixel_count} pixels")
     
     # Use greedy rectangle merging to generate optimized mesh
-    h, w = ring_mask.shape
+    # Note: h, w are padded dimensions; use pad offset for world coordinates
     processed = np.zeros_like(ring_mask, dtype=bool)
     vertices = []
     faces = []
@@ -1233,10 +1246,11 @@ def _generate_outline_mesh(mask_solid, pixel_scale, outline_width_mm, outline_th
             processed[y:y_end, x_start:x_end] = True
             
             # Convert to world coordinates (flip Y, apply scale)
-            world_x0 = float(x_start) * pixel_scale
-            world_x1 = float(x_end) * pixel_scale
-            world_y0 = float(h - y_end) * pixel_scale
-            world_y1 = float(h - y) * pixel_scale
+            # Subtract pad offset so coordinates align with the original (unpadded) model
+            world_x0 = float(x_start - pad) * pixel_scale
+            world_x1 = float(x_end - pad) * pixel_scale
+            world_y0 = float(h_original - (y_end - pad)) * pixel_scale
+            world_y1 = float(h_original - (y - pad)) * pixel_scale
             z_bot = 0.0
             z_tp = float(outline_layers) * PrinterConfig.LAYER_HEIGHT
             
@@ -1468,8 +1482,8 @@ def generate_auto_height_map(color_list, mode, base_thickness, max_relief_height
             # Keep the ratio as is: 0 -> 0, 1 -> 1
             ratio = normalized
         
-        # Calculate final height
-        height = base_thickness + ratio * delta_z
+        # Calculate final height (minimum 0.08mm = 1 layer height)
+        height = max(0.08, base_thickness + ratio * delta_z)
         
         # Round to 0.1mm precision
         color_height_map[color] = round(height, 1)
@@ -1487,10 +1501,11 @@ def _build_relief_voxel_matrix(matched_rgb, material_matrix, mask_solid, color_h
                                default_height, structure_mode, backing_color_id, pixel_scale,
                                height_matrix=None):
     """
-    Build 2.5D relief voxel matrix with per-color variable heights.
+    Build 2.5D relief voxel matrix with per-color or per-pixel variable heights.
     
-    This function creates a voxel matrix where different colors have different Z heights,
-    while preserving the top 5 layers (0.4mm) for optical color mixing.
+    Supports two modes:
+    1. Color height map mode (default): heights assigned by color
+    2. Heightmap mode: heights from external grayscale heightmap (per-pixel)
     
     Physical Model:
     - Each color region has its own target height (Target_Z)
@@ -1502,16 +1517,14 @@ def _build_relief_voxel_matrix(matched_rgb, material_matrix, mask_solid, color_h
         material_matrix: (H, W, 5) material matrix for optical layers
         mask_solid: (H, W) boolean mask of solid pixels
         color_height_map: dict mapping hex colors to heights in mm
-                         e.g., {'#ff0000': 4.0, '#00ff00': 2.5}
         default_height: default height in mm for colors not in map
         structure_mode: "Double-sided" or "Single-sided"
         backing_color_id: backing material ID (0-7)
         pixel_scale: mm per pixel
+        height_matrix: optional (H, W) float32 per-pixel height matrix from heightmap
     
     Returns:
         tuple: (full_matrix, backing_metadata)
-            - full_matrix: (Z, H, W) voxel matrix with variable heights
-            - backing_metadata: dict with backing info
     """
     target_h, target_w = material_matrix.shape[:2]
     
@@ -1522,29 +1535,26 @@ def _build_relief_voxel_matrix(matched_rgb, material_matrix, mask_solid, color_h
     print(f"[RELIEF] Building 2.5D relief voxel matrix...")
     print(f"[RELIEF] Optical layer thickness: {OPTICAL_THICKNESS_MM}mm ({OPTICAL_LAYERS} layers)")
     
-    # Step 1: 构建逐像素高度矩阵
+    # Step 1: Build per-pixel height matrix
     if height_matrix is not None:
-        # 高度图模式：直接使用传入的逐像素高度矩阵
+        # Heightmap mode: use provided per-pixel height matrix
         print(f"[RELIEF] 🗺️ 使用高度图模式（逐像素高度）")
         pixel_heights = height_matrix.copy()
-        # 高度钳制：像素高度 < OPTICAL_LAYERS 厚度时钳制为最小值
+        # Clamp: pixel height < optical thickness → set to optical thickness
         pixel_heights[mask_solid & (pixel_heights < OPTICAL_THICKNESS_MM)] = OPTICAL_THICKNESS_MM
     else:
-        # 原有 color_height_map 模式：按颜色分配高度
+        # Color height map mode: assign heights by color
         pixel_heights = np.full((target_h, target_w), default_height, dtype=np.float32)
-        
         for y in range(target_h):
             for x in range(target_w):
                 if not mask_solid[y, x]:
                     continue
-                
                 r, g, b = matched_rgb[y, x]
                 hex_color = f'#{r:02x}{g:02x}{b:02x}'
-                
                 if hex_color in color_height_map:
                     pixel_heights[y, x] = color_height_map[hex_color]
     
-    # Step 2: 计算最大高度以确定总 Z 层数
+    # Step 2: Calculate max height to determine total Z layers
     max_height_mm = np.max(pixel_heights[mask_solid]) if np.any(mask_solid) else default_height
     max_z_layers = max(OPTICAL_LAYERS + 1, int(np.ceil(max_height_mm / PrinterConfig.LAYER_HEIGHT)))
     
@@ -1555,57 +1565,40 @@ def _build_relief_voxel_matrix(matched_rgb, material_matrix, mask_solid, color_h
     # Step 3: 初始化体素矩阵
     full_matrix = np.full((max_z_layers, target_h, target_w), -1, dtype=int)
     
-    # Step 4: 填充体素矩阵
+    # Step 4: Fill voxel matrix
     if height_matrix is not None:
-        # 向量化操作：高度图模式使用 NumPy 批量填充，避免逐像素 Python 循环
-        # 计算每个像素的目标层数
+        # Vectorized fill for heightmap mode (much faster for large images)
         target_z_layers = np.ceil(pixel_heights / PrinterConfig.LAYER_HEIGHT).astype(int)
         target_z_layers = np.clip(target_z_layers, OPTICAL_LAYERS, max_z_layers)
-        
-        # 计算光学层起始位置
         optical_start_z = target_z_layers - OPTICAL_LAYERS
         
-        # 获取实心像素坐标
-        solid_ys, solid_xs = np.where(mask_solid)
-        
-        # 逐层填充基座层（backing）
+        # Fill backing layers
         for z in range(max_z_layers):
-            # 该层需要填充 backing 的像素：z < optical_start_z[y, x] 且为实心
             backing_mask = mask_solid & (z < optical_start_z)
             full_matrix[z][backing_mask] = backing_color_id
         
-        # 填充光学层（向量化逐层）
+        # Fill optical layers
+        solid_ys, solid_xs = np.where(mask_solid)
         for layer_idx in range(OPTICAL_LAYERS):
-            # 该光学层对应的 z 位置 = optical_start_z + layer_idx
             z_positions = optical_start_z + layer_idx
-            
             for i in range(len(solid_ys)):
                 y, x = solid_ys[i], solid_xs[i]
                 z = z_positions[y, x]
                 if z < max_z_layers:
-                    # 反转顺序：layer 0 在底部，layer 4 在顶部（观赏面朝上）
                     mat_id = material_matrix[y, x, OPTICAL_LAYERS - 1 - layer_idx]
                     full_matrix[z, y, x] = mat_id
     else:
-        # 原有逐像素循环模式
+        # Original per-pixel loop for color height map mode
         for y in range(target_h):
             for x in range(target_w):
                 if not mask_solid[y, x]:
                     continue
-                
-                # 获取该像素的目标高度
-                target_height_mm = pixel_heights[y, x]
+                target_height_mm = max(0.08, pixel_heights[y, x])
                 target_z_layers_px = int(np.ceil(target_height_mm / PrinterConfig.LAYER_HEIGHT))
                 target_z_layers_px = max(OPTICAL_LAYERS, min(target_z_layers_px, max_z_layers))
-                
-                # 计算基座层和光学层范围
                 optical_start_z_px = target_z_layers_px - OPTICAL_LAYERS
-                
-                # 填充基座层
                 for z in range(optical_start_z_px):
                     full_matrix[z, y, x] = backing_color_id
-                
-                # 填充光学层（反转顺序）
                 for layer_idx in range(OPTICAL_LAYERS):
                     z = optical_start_z_px + layer_idx
                     if z < max_z_layers:
@@ -1613,7 +1606,6 @@ def _build_relief_voxel_matrix(matched_rgb, material_matrix, mask_solid, color_h
                         full_matrix[z, y, x] = mat_id
     
     # Step 5: Relief mode is always single-sided (观赏面朝上)
-    # Double-sided mode doesn't make sense for relief - the viewing surface is on top
     backing_z_range = (0, max_z_layers - OPTICAL_LAYERS - 1)
     
     backing_metadata = {

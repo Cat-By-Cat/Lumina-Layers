@@ -97,15 +97,6 @@ class HeightmapLoader:
 
         偏差公式: |w1/h1 - w2/h2| / (w2/h2)
         偏差超过 20% 返回警告字符串，否则返回 None。
-
-        Args:
-            heightmap_w: 高度图宽度
-            heightmap_h: 高度图高度
-            target_w: 目标宽度
-            target_h: 目标高度
-
-        Returns:
-            str | None: 警告信息或 None
         """
         if heightmap_h == 0 or target_h == 0:
             return "⚠️ 高度图或目标图高度为 0，无法计算宽高比"
@@ -127,16 +118,10 @@ class HeightmapLoader:
         检查灰度图对比度（标准差）。
 
         标准差小于 1.0 表示灰度变化极小，浮雕效果可能不明显。
-
-        Args:
-            grayscale: (H, W) uint8 灰度数组
-
-        Returns:
-            str | None: 警告信息或 None
         """
         std_val = float(np.std(grayscale))
         if std_val < 1.0:
-            return f"⚠️ 高度图灰度变化极小（标准差={std_val:.2f}），浮雕效果可能不明显"
+            return f"⚠️ 高度图灰度变化极小（标准差 {std_val:.2f}），浮雕效果可能不明显"
         return None
 
     @staticmethod
@@ -217,6 +202,7 @@ class HeightmapLoader:
     ) -> dict:
         """
         加载高度图并生成 Height_Matrix。
+
         完整处理流程：加载 → 验证 → 灰度转换 → 宽高比检查 → 缩放 → 对比度检查 → 高度映射。
 
         Args:
