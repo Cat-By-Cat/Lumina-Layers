@@ -19,7 +19,7 @@ from colormath.color_diff import delta_e_cie2000
 
 from config import PrinterConfig, ColorSystem, SmartConfig, OUTPUT_DIR
 from core.naming import generate_calibration_filename
-from utils import Stats
+from utils import Stats, safe_fix_3mf_names
 from utils.bambu_3mf_writer import export_scene_with_bambu_metadata
 
 
