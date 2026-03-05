@@ -66,6 +66,18 @@ class BambuStudio3MFWriter:
             name: Object name (e.g., "White", "Cyan", "Magenta")
             color_rgb: RGB color tuple (0-255)
         """
+        if mesh is None:
+            raise ValueError(f"[BAMBU_3MF] Cannot add mesh '{name}': mesh is None")
+
+        vertices = getattr(mesh, "vertices", None)
+        faces = getattr(mesh, "faces", None)
+        v_count = len(vertices) if vertices is not None else 0
+        f_count = len(faces) if faces is not None else 0
+        if v_count == 0 or f_count == 0:
+            raise ValueError(
+                f"[BAMBU_3MF] Cannot add mesh '{name}': empty geometry (v={v_count}, f={f_count})"
+            )
+
         self.objects.append((mesh, name, color_rgb))
         
     def export(self):
@@ -75,6 +87,9 @@ class BambuStudio3MFWriter:
         Returns:
             str: Path to the exported 3MF file
         """
+        if len(self.objects) == 0:
+            raise ValueError("[BAMBU_3MF] Refusing to export 3MF: no mesh objects were added")
+
         print(f"[BAMBU_3MF] Exporting {len(self.objects)} objects to {self.output_path}")
         
         # Create a temporary directory for 3MF contents
@@ -553,6 +568,11 @@ def export_scene_with_bambu_metadata(scene: trimesh.Scene, output_path: str,
     Returns:
         str: Path to the exported 3MF file
     """
+    if scene is None:
+        raise ValueError("[BAMBU_3MF] Scene is None")
+    if not slot_names:
+        raise ValueError("[BAMBU_3MF] slot_names is empty - no exportable objects")
+
     # CRITICAL: Use actual number of colors, not the LUT color mode
     # This ensures filament list matches actual model parts
     num_used_colors = len(slot_names)
@@ -593,15 +613,22 @@ def export_scene_with_bambu_metadata(scene: trimesh.Scene, output_path: str,
     
     print(f"[BAMBU_3MF] Color mapping: {list(name_to_color.keys())}")
     
-    # Add each mesh from the scene IN THE ORDER OF slot_names
-    # This ensures extruder IDs match the filament list order
+    # Add each mesh from the scene IN THE ORDER OF slot_names.
+    # Use strict exact-name matching to avoid accidental substring collisions.
+    unmatched = []
     for slot_name in slot_names:
-        # Find mesh with this slot_name
-        for geom_name, mesh in scene.geometry.items():
-            if slot_name in geom_name or geom_name in slot_name:
-                color_rgb = name_to_color.get(slot_name, (200, 200, 200))
-                writer.add_mesh(mesh, geom_name, color_rgb)
-                print(f"[BAMBU_3MF] Added mesh '{geom_name}' with color {color_rgb}")
-                break
+        mesh = scene.geometry.get(slot_name)
+        if mesh is None:
+            unmatched.append(slot_name)
+            continue
+
+        color_rgb = name_to_color.get(slot_name, (200, 200, 200))
+        writer.add_mesh(mesh, slot_name, color_rgb)
+        print(f"[BAMBU_3MF] Added mesh '{slot_name}' with color {color_rgb}")
+
+    if unmatched:
+        raise ValueError(
+            "[BAMBU_3MF] Missing geometries for slot names: " + ", ".join(unmatched)
+        )
     
     return writer.export()

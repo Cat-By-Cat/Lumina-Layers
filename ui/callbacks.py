@@ -13,6 +13,26 @@ from core.extractor import generate_simulated_reference
 from utils import LUTManager
 
 
+def _hex_to_rgb_tuple(hex_color: str):
+    h = (hex_color or '').strip().lower()
+    if not h.startswith('#'):
+        h = f"#{h}"
+    return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
+
+
+def _build_full_color_region_mask(cache, selected_color: str):
+    q_img = (cache or {}).get('quantized_image')
+    m_img = (cache or {}).get('matched_rgb')
+    solid = (cache or {}).get('mask_solid')
+    if q_img is None or m_img is None or solid is None or not selected_color:
+        return None
+
+    rgb = _hex_to_rgb_tuple(selected_color)
+    q_match = np.all(q_img == np.array(rgb, dtype=np.uint8), axis=2)
+    m_match = np.all(m_img == np.array(rgb, dtype=np.uint8), axis=2)
+    return solid & (q_match | m_match)
+
+
 # ═══════════════════════════════════════════════════════════════
 # LUT Management Callbacks
 # ═══════════════════════════════════════════════════════════════
@@ -30,9 +50,9 @@ def on_lut_select(display_name):
     lut_path = LUTManager.get_lut_path(display_name)
     
     if lut_path:
-        return lut_path, f"✅ Selected: {display_name}"
+        return lut_path, f"[OK] Selected: {display_name}"
     else:
-        return None, f"❌ File not found: {display_name}"
+        return None, f"[ERROR] File not found: {display_name}"
 
 
 def on_lut_upload_save(uploaded_file):
@@ -63,7 +83,7 @@ def get_next_hint(mode, pts_count):
     """Get next corner point hint based on mode"""
     conf = ColorSystem.get(mode)
     if pts_count >= 4:
-        return "#### ✅ Positioning complete! Ready to extract!"
+        return "#### [OK] Positioning complete! Ready to extract!"
     label_zh = conf['corner_labels'][pts_count]
     label_en = conf.get('corner_labels_en', conf['corner_labels'])[pts_count]
     return f"#### 👉 点击 Click: **{label_zh} / {label_en}**"
@@ -94,7 +114,7 @@ def on_extractor_click(img, pts, mode, evt: gr.SelectData):
     """Set corner point by clicking image"""
     from core.extractor import draw_corner_points
     if len(pts) >= 4:
-        return img, pts, "#### ✅ 定位完成 Complete!"
+        return img, pts, "#### [OK] 定位完成 Complete!"
     n = pts + [[evt.index[0], evt.index[1]]]
     vis = draw_corner_points(img, n, mode)
     hint = get_next_hint(mode, len(n))
@@ -132,125 +152,133 @@ def on_palette_color_select(palette_html, evt: gr.SelectData, lang: str = "zh"):
 
 
 def on_apply_color_replacement(cache, selected_color, replacement_color,
-                               replacement_map, replacement_history, loop_pos, add_loop,
+                               replacement_regions, replacement_history,
+                               loop_pos, add_loop,
                                loop_width, loop_length, loop_hole, loop_angle,
                                lang: str = "zh"):
     """
     Apply a color replacement to the preview.
-    
-    Args:
-        cache: Preview cache from generate_preview_cached
-        selected_color: Currently selected original color (hex string)
-        replacement_color: New color to replace with (hex string from ColorPicker)
-        replacement_map: Current replacement map dict
-        replacement_history: History stack for undo
-        loop_pos: Loop position tuple
-        add_loop: Whether loop is enabled
-        loop_width: Loop width in mm
-        loop_length: Loop length in mm
-        loop_hole: Loop hole diameter in mm
-        loop_angle: Loop rotation angle
-    
+
     Returns:
-        tuple: (preview_image, updated_cache, palette_html, updated_replacement_map, 
-                updated_history, status)
+        tuple: (preview_image, updated_cache, palette_html,
+                updated_replacement_regions, updated_history, status)
     """
     from core.converter import update_preview_with_replacements
-    from ui.palette_extension import generate_palette_html
-    
+
     if cache is None:
-        return None, None, "", replacement_map, replacement_history, I18n.get('palette_need_preview', lang)
-    
+        return None, None, "", replacement_regions, replacement_history, I18n.get('palette_need_preview', lang)
+
     if not selected_color:
-        return gr.update(), cache, gr.update(), replacement_map, replacement_history, I18n.get('palette_need_original', lang)
+        return gr.update(), cache, gr.update(), replacement_regions, replacement_history, I18n.get('palette_need_original', lang)
 
     if not replacement_color:
-        return gr.update(), cache, gr.update(), replacement_map, replacement_history, I18n.get('palette_need_replacement', lang)
-    
-    # Save current state to history before applying new replacement
+        return gr.update(), cache, gr.update(), replacement_regions, replacement_history, I18n.get('palette_need_replacement', lang)
+
+    # Save current regions-only state to history
     new_history = replacement_history.copy() if replacement_history else []
-    new_history.append(replacement_map.copy() if replacement_map else {})
-    
-    # Update replacement map
-    new_map = replacement_map.copy() if replacement_map else {}
-    new_map[selected_color] = replacement_color
-    
-    # Apply replacements and update preview
+    new_history.append((replacement_regions.copy() if replacement_regions else []))
+
+    new_regions = replacement_regions.copy() if replacement_regions else []
+
+    region_mask = cache.get('selected_region_mask')
+    if region_mask is None:
+        region_mask = _build_full_color_region_mask(cache, selected_color)
+
+    if region_mask is not None and np.any(region_mask):
+        new_regions.append({
+            'source': selected_color,
+            'matched': cache.get('selected_matched_hex') or selected_color,
+            'quantized': cache.get('selected_quantized_hex') or selected_color,
+            'replacement': replacement_color,
+            'mask': region_mask.copy()
+        })
+
     display, updated_cache, palette_html = update_preview_with_replacements(
-        cache, new_map, loop_pos, add_loop,
+        cache, new_regions, loop_pos, add_loop,
         loop_width, loop_length, loop_hole, loop_angle,
         lang=lang
     )
-    
+
     status_msg = I18n.get('palette_replaced', lang).format(src=selected_color, dst=replacement_color)
-    return display, updated_cache, palette_html, new_map, new_history, status_msg
+    return display, updated_cache, palette_html, new_regions, new_history, status_msg
 
 
-def on_clear_color_replacements(cache, replacement_map, replacement_history,
+
+def on_clear_color_replacements(cache, replacement_regions, replacement_history,
                                 loop_pos, add_loop,
                                 loop_width, loop_length, loop_hole, loop_angle,
                                 lang: str = "zh"):
     """
     Clear all color replacements and restore original preview.
-    
-    Args:
-        cache: Preview cache
-        replacement_map: Current replacement map dict
-        replacement_history: History stack for undo
-        loop_pos: Loop position tuple
-        add_loop: Whether loop is enabled
-        loop_width: Loop width in mm
-        loop_length: Loop length in mm
-        loop_hole: Loop hole diameter in mm
-        loop_angle: Loop rotation angle
-    
+
     Returns:
-        tuple: (preview_image, updated_cache, palette_html, empty_replacement_map, 
-                updated_history, status)
+        tuple: (preview_image, updated_cache, palette_html,
+                empty_replacement_regions, updated_history, status)
     """
     from core.converter import update_preview_with_replacements
-    from ui.palette_extension import generate_palette_html
-    
+
     if cache is None:
-        return None, None, "", {}, [], I18n.get('palette_need_preview', lang)
-    
-    # Save current state to history before clearing
+        return None, None, "", [], [], I18n.get('palette_need_preview', lang)
+
+    # Save current regions-only state to history before clearing
     new_history = replacement_history.copy() if replacement_history else []
-    if replacement_map:
-        new_history.append(replacement_map.copy())
-    
-    # Clear replacements by passing empty dict
+    if replacement_regions:
+        new_history.append(replacement_regions.copy())
+
     display, updated_cache, palette_html = update_preview_with_replacements(
-        cache, {}, loop_pos, add_loop,
+        cache, [], loop_pos, add_loop,
         loop_width, loop_length, loop_hole, loop_angle,
         lang=lang
     )
-    
-    return display, updated_cache, palette_html, {}, new_history, I18n.get('palette_cleared', lang)
+
+    return display, updated_cache, palette_html, [], new_history, I18n.get('palette_cleared', lang)
+
 
 
 def on_preview_generated_update_palette(cache, lang: str = "zh"):
     """
     Update palette display after preview is generated.
-    
+
     Args:
         cache: Preview cache from generate_preview_cached
-    
+
     Returns:
         tuple: (palette_html, selected_color_state)
     """
     from ui.palette_extension import generate_palette_html
-    
+
     if cache is None:
         placeholder = I18n.get('conv_palette_replacements_placeholder', lang)
         return (
             f"<p style='color:#888;'>{placeholder}</p>",
             None  # selected_color state
         )
-    
+
     palette = cache.get('color_palette', [])
-    palette_html = generate_palette_html(palette, {}, None, lang=lang)
-    
+
+    auto_pairs = []
+    q_img = cache.get('quantized_image')
+    m_img = cache.get('matched_rgb')
+    mask = cache.get('mask_solid')
+    if q_img is not None and m_img is not None and mask is not None:
+        h, w = m_img.shape[:2]
+        for y in range(h):
+            for x in range(w):
+                if not mask[y, x]:
+                    continue
+                qh = f"#{int(q_img[y,x,0]):02x}{int(q_img[y,x,1]):02x}{int(q_img[y,x,2]):02x}"
+                mh = f"#{int(m_img[y,x,0]):02x}{int(m_img[y,x,1]):02x}{int(m_img[y,x,2]):02x}"
+                auto_pairs.append({"quantized_hex": qh, "matched_hex": mh})
+
+    palette_html = generate_palette_html(
+        palette,
+        {},
+        None,
+        lang=lang,
+        replacement_regions=[],
+        auto_pairs=auto_pairs,
+    )
+
     return (
         palette_html,
         None  # Reset selected color
@@ -273,7 +301,7 @@ def on_color_swatch_click(selected_hex):
     # Clean up the hex value
     hex_color = selected_hex.strip()
     
-    return hex_color, f"✅ {hex_color}"
+    return hex_color, f"[OK] {hex_color}"
 
 
 def on_color_dropdown_select(selected_value):
@@ -289,7 +317,7 @@ def on_color_dropdown_select(selected_value):
     if not selected_value:
         return None, "未选择"
     
-    return selected_value, f"✅ {selected_value}"
+    return selected_value, f"[OK] {selected_value}"
 
 
 def on_lut_change_update_colors(lut_path, cache=None):
@@ -463,48 +491,100 @@ def on_clear_highlight(cache, loop_pos, add_loop,
 # Undo Color Replacement Callback
 # ═══════════════════════════════════════════════════════════════
 
-def on_undo_color_replacement(cache, replacement_map, replacement_history,
+def on_delete_selected_user_replacement(
+    cache, replacement_regions, replacement_history,
+    selected_user_row_id,
+    loop_pos, add_loop, loop_width, loop_length, loop_hole, loop_angle,
+    lang: str = 'zh'
+):
+    """按选中用户行删除并刷新预览（regions-only）。"""
+    updater = globals().get('update_preview_with_replacements')
+    if updater is None:
+        from core.converter import update_preview_with_replacements as updater
+
+    if cache is None:
+        return None, None, "", replacement_regions, replacement_history, I18n.get('palette_need_preview', lang), selected_user_row_id
+
+    if not selected_user_row_id:
+        return gr.update(), cache, gr.update(), replacement_regions, replacement_history, I18n.get('conv_palette_delete_selected_empty', lang), selected_user_row_id
+
+    old_regions = replacement_regions.copy() if replacement_regions else []
+
+    new_history = replacement_history.copy() if replacement_history else []
+    new_history.append(old_regions.copy())
+
+    raw_user_rows = []
+    for item in old_regions:
+        raw_user_rows.append({
+            'quantized': (item.get('quantized') or item.get('source') or '').lower(),
+            'matched': (item.get('matched') or item.get('source') or '').lower(),
+            'replacement': (item.get('replacement') or '').lower(),
+            'origin': 'region',
+            'index': len(raw_user_rows),
+        })
+
+    filtered_rows = [r for r in raw_user_rows if r['quantized'] and r['replacement']]
+    indexed_rows = []
+    for idx, r in enumerate(filtered_rows):
+        rr = dict(r)
+        rr['row_id'] = f"user::{rr['quantized']}|{rr['matched']}|{rr['replacement']}|{idx}"
+        indexed_rows.append(rr)
+    user_rows = list(reversed(indexed_rows))
+
+    target = next((r for r in user_rows if r['row_id'] == selected_user_row_id), None)
+    if target is None:
+        return gr.update(), cache, gr.update(), old_regions, new_history, I18n.get('conv_palette_delete_selected_empty', lang), None
+
+    new_regions = old_regions.copy()
+
+    rev_idx = user_rows.index(target)
+    raw_index = (len(raw_user_rows) - 1) - rev_idx
+    if 0 <= raw_index < len(raw_user_rows):
+        del new_regions[raw_index]
+    else:
+        q, m, rep = target['quantized'], target['matched'], target['replacement']
+        for i, item in enumerate(new_regions):
+            iq = (item.get('quantized') or item.get('source') or '').lower()
+            im = (item.get('matched') or item.get('source') or '').lower()
+            ir = (item.get('replacement') or '').lower()
+            if iq == q and im == m and ir == rep:
+                del new_regions[i]
+                break
+
+    display, updated_cache, palette_html = updater(
+        cache, new_regions,
+        loop_pos, add_loop, loop_width, loop_length, loop_hole, loop_angle,
+        lang=lang
+    )
+
+    return display, updated_cache, palette_html, new_regions, new_history, I18n.get('palette_cleared', lang), None
+
+
+def on_undo_color_replacement(cache, replacement_regions, replacement_history,
                                loop_pos, add_loop, loop_width, loop_length,
                                loop_hole, loop_angle, lang: str = "zh"):
     """
-    Undo the last color replacement operation.
-    
-    Args:
-        cache: Preview cache from generate_preview_cached
-        replacement_map: Current replacement map dict
-        replacement_history: History stack of previous states
-        loop_pos: Loop position tuple
-        add_loop: Whether loop is enabled
-        loop_width: Loop width in mm
-        loop_length: Loop length in mm
-        loop_hole: Loop hole diameter in mm
-        loop_angle: Loop rotation angle
-    
-    Returns:
-        tuple: (preview_image, updated_cache, palette_html, updated_replacement_map, 
-                updated_history, status)
+    Undo the last color replacement operation (regions-only).
     """
     from core.converter import update_preview_with_replacements
-    from ui.palette_extension import generate_palette_html
-    
+
     if cache is None:
-        return None, None, "", replacement_map, replacement_history, I18n.get('palette_need_preview', lang)
-    
+        return None, None, "", replacement_regions, replacement_history, I18n.get('palette_need_preview', lang)
+
     if not replacement_history:
-        return None, cache, "", replacement_map, replacement_history, I18n.get('palette_undo_empty', lang)
-    
-    # Pop the last state from history
+        return None, cache, "", replacement_regions, replacement_history, I18n.get('palette_undo_empty', lang)
+
     new_history = replacement_history.copy()
-    previous_map = new_history.pop()
-    
-    # Apply the previous replacement map
+    previous_regions = new_history.pop()
+
     display, updated_cache, palette_html = update_preview_with_replacements(
-        cache, previous_map, loop_pos, add_loop,
+        cache, previous_regions, loop_pos, add_loop,
         loop_width, loop_length, loop_hole, loop_angle,
         lang=lang
     )
-    
-    return display, updated_cache, palette_html, previous_map, new_history, I18n.get('palette_undone', lang)
+
+    return display, updated_cache, palette_html, previous_regions, new_history, I18n.get('palette_undone', lang)
+
 
 def run_extraction_wrapper(img, points, offset_x, offset_y, zoom, barrel, wb, bright, color_mode, page_choice):
     """Wrapper for extraction: supports 8-Color page saving."""
@@ -558,7 +638,7 @@ def merge_8color_data():
     print(f"[MERGE_8COLOR] Page 2 exists: {os.path.exists(path2)}")
     
     if not os.path.exists(path1) or not os.path.exists(path2):
-        return None, "❌ Missing temp pages. Please extract Page 1 and Page 2 first."
+        return None, "[ERROR] Missing temp pages. Please extract Page 1 and Page 2 first."
     
     try:
         lut1 = np.load(path1)
@@ -572,12 +652,12 @@ def merge_8color_data():
         np.save(LUT_FILE_PATH, merged)
         print(f"[MERGE_8COLOR] Saved merged LUT to: {LUT_FILE_PATH}")
         
-        return LUT_FILE_PATH, "✅ 8-Color LUT merged and saved!"
+        return LUT_FILE_PATH, "[OK] 8-Color LUT merged and saved!"
     except Exception as e:
         print(f"[MERGE_8COLOR] Error: {e}")
         import traceback
         traceback.print_exc()
-        return None, f"❌ Merge failed: {e}"
+        return None, f"[ERROR] Merge failed: {e}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -600,13 +680,13 @@ def on_merge_lut_select(display_name, lang="zh"):
 
     lut_path = LUTManager.get_lut_path(display_name)
     if not lut_path:
-        return f"**{I18n.get('merge_mode_label', lang)}**: ❌ File not found"
+        return f"**{I18n.get('merge_mode_label', lang)}**: [ERROR] File not found"
 
     try:
         mode, count = LUTMerger.detect_color_mode(lut_path)
         return f"**{I18n.get('merge_mode_label', lang)}**: {mode} ({count} colors)"
     except Exception as e:
-        return f"**{I18n.get('merge_mode_label', lang)}**: ❌ {e}"
+        return f"**{I18n.get('merge_mode_label', lang)}**: [ERROR] {e}"
 
 
 def on_merge_primary_select(display_name, lang="zh"):

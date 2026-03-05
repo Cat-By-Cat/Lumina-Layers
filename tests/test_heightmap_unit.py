@@ -224,7 +224,7 @@ class TestErrorHandling:
         grayscale = np.zeros((10, 10), dtype=np.uint8)
         warning = HeightmapLoader._check_contrast(grayscale)
         assert warning is not None
-        assert "⚠️" in warning
+        assert "[WARNING]" in warning
 
     def test_no_contrast_warning_for_normal_image(self):
         """验证正常对比度图像不返回警告"""

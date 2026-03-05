@@ -99,7 +99,7 @@ class HeightmapLoader:
         偏差超过 20% 返回警告字符串，否则返回 None。
         """
         if heightmap_h == 0 or target_h == 0:
-            return "⚠️ 高度图或目标图高度为 0，无法计算宽高比"
+            return "[WARNING] 高度图或目标图高度为 0，无法计算宽高比"
 
         hm_ratio = heightmap_w / heightmap_h
         target_ratio = target_w / target_h
@@ -121,7 +121,7 @@ class HeightmapLoader:
         """
         std_val = float(np.std(grayscale))
         if std_val < 1.0:
-            return f"⚠️ 高度图灰度变化极小（标准差 {std_val:.2f}），浮雕效果可能不明显"
+            return f"[WARNING] 高度图灰度变化极小（标准差 {std_val:.2f}），浮雕效果可能不明显"
         return None
 
     @staticmethod

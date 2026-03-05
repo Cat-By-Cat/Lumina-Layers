@@ -6,9 +6,11 @@ UI layout definition - Refactored version with language switching support
 
 import json
 import os
+import re
 import shutil
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import gradio as gr
@@ -40,7 +42,10 @@ from core.converter import (
     generate_lut_card_grid_html,
     detect_lut_color_mode,
     detect_image_type,
-    generate_auto_height_map
+    generate_auto_height_map,
+    _build_dual_recommendations,
+    _resolve_click_selection_hexes,
+    get_lut_color_choices,
 )
 from core.heightmap_loader import HeightmapLoader
 from .styles import CUSTOM_CSS
@@ -58,6 +63,7 @@ from .callbacks import (
     on_clear_color_replacements,
     on_undo_color_replacement,
     on_preview_generated_update_palette,
+    on_delete_selected_user_replacement,
     on_highlight_color_change,
     on_clear_highlight,
     run_extraction_wrapper,
@@ -361,25 +367,25 @@ def detect_installed_slicers():
 def open_in_slicer(file_path, slicer_id):
     """Open a 3MF file in the specified slicer."""
     if not file_path:
-        return "❌ 没有可打开的文件 / No file to open"
+        return "[ERROR] 没有可打开的文件 / No file to open"
     
     actual_path = file_path
     if hasattr(file_path, 'name'):
         actual_path = file_path.name
     
     if not os.path.isfile(actual_path):
-        return f"❌ 文件不存在: {actual_path}"
+        return f"[ERROR] 文件不存在: {actual_path}"
     
     # Find exe from detected slicers
     for sid, name, exe in _INSTALLED_SLICERS:
         if sid == slicer_id:
             try:
                 subprocess.Popen([exe, actual_path])
-                return f"✅ 已在 {name} 中打开"
+                return f"[OK] 已在 {name} 中打开"
             except Exception as e:
-                return f"❌ 启动 {name} 失败: {e}"
+                return f"[ERROR] 启动 {name} 失败: {e}"
     
-    return f"❌ 未找到切片软件: {slicer_id}"
+    return f"[ERROR] 未找到切片软件: {slicer_id}"
 
 
 # Detect slicers at startup
@@ -906,7 +912,7 @@ def _preview_update(img):
 def process_batch_generation(batch_files, is_batch, single_image, lut_path, target_width_mm,
                              spacer_thick, structure_mode, auto_bg, bg_tol, color_mode,
                              add_loop, loop_width, loop_length, loop_hole, loop_pos,
-                             modeling_mode, quantize_colors, color_replacements=None,
+                             modeling_mode, quantize_colors, replacement_regions=None,
                              separate_backing=False, enable_relief=False, color_height_map=None,
                              heightmap_path=None, heightmap_max_height=None,
                              enable_cleanup=True,
@@ -942,7 +948,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
     
     args = (lut_path, target_width_mm, spacer_thick, structure_mode, auto_bg, bg_tol,
             color_mode, add_loop, loop_width, loop_length, loop_hole, loop_pos,
-            modeling_mode, quantize_colors, color_replacements, backing_color_name,
+            modeling_mode, quantize_colors, replacement_regions, backing_color_name,
             separate_backing, enable_relief, color_height_map,
             heightmap_path, heightmap_max_height,
             enable_cleanup,
@@ -952,11 +958,43 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
             enable_coating, coating_height_mm)
 
     if not is_batch:
-        out_path, glb_path, preview_img, status = generate_final_model(single_image, *args)
+        out_path, glb_path, preview_img, status = generate_final_model(
+            image_path=single_image,
+            lut_path=lut_path,
+            target_width_mm=target_width_mm,
+            spacer_thick=spacer_thick,
+            structure_mode=structure_mode,
+            auto_bg=auto_bg,
+            bg_tol=bg_tol,
+            color_mode=color_mode,
+            add_loop=add_loop,
+            loop_width=loop_width,
+            loop_length=loop_length,
+            loop_hole=loop_hole,
+            loop_pos=loop_pos,
+            modeling_mode=modeling_mode,
+            quantize_colors=quantize_colors,
+            replacement_regions=replacement_regions,
+            backing_color_name=backing_color_name,
+            separate_backing=separate_backing,
+            enable_relief=enable_relief,
+            color_height_map=color_height_map,
+            heightmap_path=heightmap_path,
+            heightmap_max_height=heightmap_max_height,
+            enable_cleanup=enable_cleanup,
+            enable_outline=enable_outline,
+            outline_width=outline_width,
+            enable_cloisonne=enable_cloisonne,
+            wire_width_mm=wire_width_mm,
+            wire_height_mm=wire_height_mm,
+            free_color_set=free_color_set,
+            enable_coating=enable_coating,
+            coating_height_mm=coating_height_mm,
+        )
         return out_path, glb_path, _preview_update(preview_img), status
 
     if not batch_files:
-        return None, None, None, "❌ 请先上传图片 / Please upload images first"
+        return None, None, None, "[ERROR] 请先上传图片 / Please upload images first"
 
     generated_files = []
     total_files = len(batch_files)
@@ -994,7 +1032,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
                 zipf.write(f, os.path.basename(f))
         logs.append(f"✅ Batch done: {len(generated_files)} model(s).")
         return zip_path, None, _preview_update(None), "\n".join(logs)
-    return None, None, _preview_update(None), "❌ Batch failed: no valid models.\n" + "\n".join(logs)
+    return None, None, _preview_update(None), "[ERROR] Batch failed: no valid models.\n" + "\n".join(logs)
 
 
 # ========== Advanced Tab Callbacks ==========
@@ -2136,9 +2174,11 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                         components['accordion_conv_palette'] = conv_palette_acc
                         # 状态变量
                         conv_selected_color = gr.State(None)  # 原图中被点击的颜色
-                        conv_replacement_map = gr.State({})   # 替换映射表
+                        conv_replacement_regions = gr.State([])  # 区域替换列表
                         conv_replacement_history = gr.State([])
                         conv_replacement_color_state = gr.State(None)  # 最终确定的 LUT 颜色
+                        conv_selected_user_row_id = gr.State(None)
+                        conv_selected_auto_row_id = gr.State(None)
                         conv_free_color_set = gr.State(set())  # 自由色集合
 
                         # 隐藏的交互组件
@@ -2192,18 +2232,42 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                             elem_classes=["hidden-textbox-trigger"],
                             visible=True
                         )
+                        conv_palette_row_select_hidden = gr.Textbox(
+                            value="",
+                            visible=True,
+                            interactive=True,
+                            elem_id="conv-palette-row-select-hidden",
+                            elem_classes=["hidden-textbox-trigger"],
+                            label="",
+                            show_label=False,
+                            container=False
+                        )
+                        conv_palette_row_select_trigger_btn = gr.Button(
+                            "trigger_palette_row_select",
+                            visible=True,
+                            elem_id="conv-palette-row-select-trigger-btn",
+                            elem_classes=["hidden-textbox-trigger"]
+                        )
+                        conv_palette_delete_trigger_btn = gr.Button(
+                            "trigger_palette_delete",
+                            visible=True,
+                            elem_id="conv-palette-delete-trigger-btn",
+                            elem_classes=["hidden-textbox-trigger"]
+                        )
 
                         # --- 新 UI 布局 ---
+                        from ui.palette_extension import build_selected_dual_color_html
+
                         with gr.Row():
                             # 左侧：当前选中的原图颜色
                             with gr.Column(scale=1):
                                 components['md_conv_palette_step1'] = gr.Markdown(
                                     I18n.get('conv_palette_step1', lang)
                                 )
-                                conv_selected_display = gr.ColorPicker(
+                                conv_selected_display = gr.HTML(
+                                    value=build_selected_dual_color_html("#000000", "#000000", lang=lang),
                                     label=I18n.get('conv_palette_selected_label', lang),
-                                    value="#000000",
-                                    interactive=False
+                                    show_label=True
                                 )
                                 components['color_conv_palette_selected_label'] = conv_selected_display
 
@@ -2228,6 +2292,13 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                                     )
                                 components['color_conv_picker_search'] = conv_color_picker_search
                                 components['btn_conv_picker_search'] = conv_color_picker_btn
+
+
+                                conv_dual_recommend_html = gr.HTML(
+                                    value="",
+                                    label="",
+                                    show_label=False
+                                )
 
                                 # LUT 网格 HTML
                                 conv_lut_grid_view = gr.HTML(
@@ -2579,22 +2650,72 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     # ========== Image Crop Extension Events (Non-invasive) ==========
     from core.image_preprocessor import ImagePreprocessor
     
+    def _parse_svg_dimensions(svg_path):
+        """Parse SVG width/height with viewBox fallback."""
+        try:
+            root = ET.parse(svg_path).getroot()
+        except Exception:
+            return 0, 0
+
+        def _parse_len(raw):
+            if not raw:
+                return None
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(raw))
+            if not m:
+                return None
+            try:
+                return int(float(m.group(1)))
+            except Exception:
+                return None
+
+        w = _parse_len(root.get("width"))
+        h = _parse_len(root.get("height"))
+
+        if w and h and w > 0 and h > 0:
+            return w, h
+
+        view_box = root.get("viewBox") or root.get("viewbox")
+        if view_box:
+            try:
+                parts = [float(v) for v in re.split(r"[,\s]+", view_box.strip()) if v]
+                if len(parts) == 4:
+                    vb_w = int(abs(parts[2]))
+                    vb_h = int(abs(parts[3]))
+                    if vb_w > 0 and vb_h > 0:
+                        return vb_w, vb_h
+            except Exception:
+                pass
+
+        return 0, 0
+
     def on_image_upload_process_with_html(image_path):
         """When image is uploaded, process and prepare for crop modal (不分析颜色)"""
         if image_path is None:
             return (
                 0, 0, None,
-                '<div id="preprocess-dimensions-data" data-width="0" data-height="0" style="display:none;"></div>'
+                '<div id="preprocess-dimensions-data" data-width="0" data-height="0" data-is-svg="0" style="display:none;"></div>'
             )
         
         try:
+            # SVG: bypass PIL-based preprocessor to avoid "cannot identify image file" noise.
+            if isinstance(image_path, str) and image_path.lower().endswith(".svg"):
+                width, height = _parse_svg_dimensions(image_path)
+                dimensions_html = (
+                    f'<div id="preprocess-dimensions-data" data-width="{width}" '
+                    f'data-height="{height}" data-is-svg="1" style="display:none;"></div>'
+                )
+                return (width, height, image_path, dimensions_html)
+
             info = ImagePreprocessor.process_upload(image_path)
             # 不在这里分析颜色，等用户确认裁剪后再分析
-            dimensions_html = f'<div id="preprocess-dimensions-data" data-width="{info.width}" data-height="{info.height}" style="display:none;"></div>'
+            dimensions_html = (
+                f'<div id="preprocess-dimensions-data" data-width="{info.width}" '
+                f'data-height="{info.height}" data-is-svg="0" style="display:none;"></div>'
+            )
             return (info.width, info.height, info.processed_path, dimensions_html)
         except Exception as e:
             print(f"Image upload error: {e}")
-            return (0, 0, None, '<div id="preprocess-dimensions-data" data-width="0" data-height="0" style="display:none;"></div>')
+            return (0, 0, None, '<div id="preprocess-dimensions-data" data-width="0" data-height="0" data-is-svg="0" style="display:none;"></div>')
     
     # JavaScript to open crop modal (不传递颜色推荐，弹窗中不显示)
     # Check if crop modal is enabled before opening
@@ -2674,6 +2795,11 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             const dimElement = document.querySelector('#preprocess-dimensions-data');
             console.log('[CROP] dimElement found:', !!dimElement);
             if (dimElement) {
+                const isSvgUpload = dimElement.dataset.isSvg === '1';
+                if (isSvgUpload) {
+                    console.log('[CROP] SVG upload detected, skipping crop modal.');
+                    return;
+                }
                 const width = parseInt(dimElement.dataset.width) || 0;
                 const height = parseInt(dimElement.dataset.height) || 0;
                 console.log('[CROP] Dimensions:', width, 'x', height);
@@ -2716,6 +2842,8 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         if processed_path is None:
             return None
         try:
+            if isinstance(processed_path, str) and processed_path.lower().endswith(".svg"):
+                return processed_path
             result_path = ImagePreprocessor.convert_to_png(processed_path)
             return result_path
         except Exception as e:
@@ -2734,6 +2862,9 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         if processed_path is None:
             return None
         try:
+            if isinstance(processed_path, str) and processed_path.lower().endswith(".svg"):
+                print("[DEBUG] SVG uploaded, skipping raster crop and keeping original path")
+                return processed_path
             import json
             data = json.loads(crop_json) if crop_json else {"x": 0, "y": 0, "w": 100, "h": 100}
             x = int(data.get("x", 0))
@@ -2888,17 +3019,90 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         glb_path = generate_realtime_glb(cache) if cache is not None else None
         return _preview_update(display), cache, status, glb_path
 
-    # 像素模式下禁用孤立像素清理 Checkbox
-    def on_modeling_mode_change_cleanup(mode):
-        if mode == ModelingMode.PIXEL:
-            return gr.update(interactive=False, value=False, info="像素模式下不支持孤立像素清理 | Not available in Pixel Art mode")
+    # 建模模式切换：统一处理可用参数提示与禁用逻辑
+    def on_modeling_mode_change_controls(mode):
+        is_pixel = mode == ModelingMode.PIXEL
+        is_vector = mode == ModelingMode.VECTOR
+
+        # Cleanup: Pixel 模式禁用，其它模式可用
+        if is_pixel:
+            cleanup_update = gr.update(
+                interactive=False,
+                value=False,
+                info="像素模式下不支持孤立像素清理 | Not available in Pixel Art mode",
+            )
         else:
-            return gr.update(interactive=True, info="清理 LUT 匹配后的孤立像素，提升打印成功率")
+            cleanup_update = gr.update(
+                interactive=True,
+                info="清理 LUT 匹配后的孤立像素，提升打印成功率",
+            )
+
+        # Outline / Cloisonné: 当前仅在 Raster 路径生效，Vector 模式禁用并提示
+        if is_vector:
+            outline_checkbox_update = gr.update(
+                interactive=False,
+                value=False,
+                info="Vector(SVG) 模式暂不支持描边；该选项仅在 Raster 路径生效",
+            )
+            outline_width_update = gr.update(
+                interactive=False,
+                info="Vector(SVG) 模式下已禁用",
+            )
+            cloisonne_checkbox_update = gr.update(
+                interactive=False,
+                value=False,
+                info="Vector(SVG) 模式暂不支持掐丝珐琅；该选项仅在 Raster 路径生效",
+            )
+            wire_width_update = gr.update(
+                interactive=False,
+                info="Vector(SVG) 模式下已禁用",
+            )
+            wire_height_update = gr.update(
+                interactive=False,
+                info="Vector(SVG) 模式下已禁用",
+            )
+        else:
+            outline_checkbox_update = gr.update(
+                interactive=True,
+                info="描边仅在生成阶段生效",
+            )
+            outline_width_update = gr.update(
+                interactive=True,
+                info=None,
+            )
+            cloisonne_checkbox_update = gr.update(
+                interactive=True,
+                info="掐丝珐琅仅在生成阶段生效（与 2.5D 浮雕互斥）",
+            )
+            wire_width_update = gr.update(
+                interactive=True,
+                info=None,
+            )
+            wire_height_update = gr.update(
+                interactive=True,
+                info=None,
+            )
+
+        return (
+            cleanup_update,
+            outline_checkbox_update,
+            outline_width_update,
+            cloisonne_checkbox_update,
+            wire_width_update,
+            wire_height_update,
+        )
 
     components['radio_conv_modeling_mode'].change(
-        on_modeling_mode_change_cleanup,
+        on_modeling_mode_change_controls,
         inputs=[components['radio_conv_modeling_mode']],
-        outputs=[components['checkbox_conv_cleanup']]
+        outputs=[
+            components['checkbox_conv_cleanup'],
+            components['checkbox_conv_outline_enable'],
+            components['slider_conv_outline_width'],
+            components['checkbox_conv_cloisonne_enable'],
+            components['slider_conv_wire_width'],
+            components['slider_conv_wire_height'],
+        ]
     ).then(
         fn=save_modeling_mode,
         inputs=[components['radio_conv_modeling_mode']],
@@ -2931,6 +3135,10 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             on_preview_generated_update_palette,
             inputs=[conv_preview_cache, lang_state],
             outputs=[conv_palette_html, conv_selected_color]
+    ).then(
+            fn=lambda: (None, None),
+            inputs=[],
+            outputs=[conv_selected_user_row_id, conv_selected_auto_row_id]
     )
 
     # Hidden textbox receives highlight color from JavaScript click (triggers preview highlight)
@@ -2958,10 +3166,109 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     def on_lut_color_click(hex_color):
         return hex_color, hex_color
 
+    def build_palette_html_with_selection(cache, replacement_regions,
+                                          selected_user_row_id, selected_auto_row_id,
+                                          lang_state_val):
+        from ui.palette_extension import generate_palette_html
+
+        if cache is None:
+            placeholder = I18n.get('conv_palette_replacements_placeholder', lang_state_val)
+            return f"<p style='color:#888;'>{placeholder}</p>"
+
+        palette = cache.get('color_palette', [])
+        auto_pairs = []
+        q_img = cache.get('quantized_image')
+        m_img = cache.get('matched_rgb')
+        mask = cache.get('mask_solid')
+        if q_img is not None and m_img is not None and mask is not None:
+            h, w = m_img.shape[:2]
+            for y in range(h):
+                for x in range(w):
+                    if not mask[y, x]:
+                        continue
+                    qh = f"#{int(q_img[y,x,0]):02x}{int(q_img[y,x,1]):02x}{int(q_img[y,x,2]):02x}"
+                    mh = f"#{int(m_img[y,x,0]):02x}{int(m_img[y,x,1]):02x}{int(m_img[y,x,2]):02x}"
+                    auto_pairs.append({"quantized_hex": qh, "matched_hex": mh})
+
+        return generate_palette_html(
+            palette,
+            replacements={},
+            selected_color=None,
+            lang=lang_state_val,
+            replacement_regions=replacement_regions or [],
+            auto_pairs=auto_pairs,
+            selected_user_row_id=selected_user_row_id,
+            selected_auto_row_id=selected_auto_row_id,
+        )
+
+    def on_palette_row_select(row_id, selected_user_row_id, selected_auto_row_id, cache):
+        row_id = (row_id or '').strip()
+
+        new_cache = cache.copy() if isinstance(cache, dict) else cache
+        if isinstance(new_cache, dict):
+            new_cache['selection_scope'] = 'global'
+            new_cache['selected_region_mask'] = None
+
+        if not row_id:
+            return selected_user_row_id, selected_auto_row_id, new_cache
+        if row_id.startswith('user::'):
+            return row_id, None, new_cache
+        if row_id.startswith('auto::'):
+            return None, row_id, new_cache
+        return selected_user_row_id, selected_auto_row_id, new_cache
+
     conv_lut_color_trigger_btn.click(
             fn=on_lut_color_click,
             inputs=[conv_lut_color_selected_hidden],
             outputs=[conv_replacement_color_state, conv_replacement_display]
+    )
+
+    conv_palette_row_select_trigger_btn.click(
+            fn=on_palette_row_select,
+            inputs=[conv_palette_row_select_hidden, conv_selected_user_row_id, conv_selected_auto_row_id, conv_preview_cache],
+            outputs=[conv_selected_user_row_id, conv_selected_auto_row_id, conv_preview_cache]
+    ).then(
+            fn=build_palette_html_with_selection,
+            inputs=[
+                conv_preview_cache, conv_replacement_regions,
+                conv_selected_user_row_id, conv_selected_auto_row_id, lang_state
+            ],
+            outputs=[conv_palette_html]
+    )
+
+    def on_delete_selected_user_replacement_regions_only(
+        cache, replacement_regions, replacement_history,
+        selected_user_row_id,
+        loop_pos, add_loop, loop_width, loop_length, loop_hole, loop_angle,
+        lang_state_val
+    ):
+        display, updated_cache, palette_html, new_regions, new_history, status, selected_user = on_delete_selected_user_replacement(
+            cache, replacement_regions, replacement_history,
+            selected_user_row_id,
+            loop_pos, add_loop, loop_width, loop_length, loop_hole, loop_angle,
+            lang_state_val
+        )
+        return display, updated_cache, palette_html, new_regions, new_history, status, selected_user
+
+    conv_palette_delete_trigger_btn.click(
+            fn=on_delete_selected_user_replacement_regions_only,
+            inputs=[
+                conv_preview_cache, conv_replacement_regions, conv_replacement_history,
+                conv_selected_user_row_id,
+                conv_loop_pos, components['checkbox_conv_loop_enable'],
+                components['slider_conv_loop_width'], components['slider_conv_loop_length'],
+                components['slider_conv_loop_hole'], components['slider_conv_loop_angle'],
+                lang_state
+            ],
+            outputs=[
+                conv_preview, conv_preview_cache, conv_palette_html,
+                conv_replacement_regions, conv_replacement_history,
+                components['textbox_conv_status'], conv_selected_user_row_id
+            ]
+    ).then(
+            fn=lambda: None,
+            inputs=[],
+            outputs=[conv_selected_auto_row_id]
     )
 
     # 以色找色: ColorPicker nearest match via KDTree
@@ -3013,74 +3320,85 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     
     # Color replacement: Apply replacement
     def on_apply_color_replacement_with_fit(cache, selected_color, replacement_color,
-                                            replacement_map, replacement_history,
+                                            replacement_regions, replacement_history,
                                             loop_pos, add_loop, loop_width, loop_length,
                                             loop_hole, loop_angle, lang_state_val):
-        display, updated_cache, palette_html, new_map, new_history, status = on_apply_color_replacement(
+        display, updated_cache, palette_html, new_regions, new_history, status = on_apply_color_replacement(
             cache, selected_color, replacement_color,
-            replacement_map, replacement_history,
+            replacement_regions, replacement_history,
             loop_pos, add_loop, loop_width, loop_length,
             loop_hole, loop_angle, lang_state_val
         )
-        return _preview_update(display), updated_cache, palette_html, new_map, new_history, status
+        return _preview_update(display), updated_cache, palette_html, new_regions, new_history, status
 
     conv_apply_replacement.click(
             on_apply_color_replacement_with_fit,
             inputs=[
                 conv_preview_cache, conv_selected_color, conv_replacement_color_state,
-                conv_replacement_map, conv_replacement_history, conv_loop_pos, components['checkbox_conv_loop_enable'],
+                conv_replacement_regions, conv_replacement_history, conv_loop_pos, components['checkbox_conv_loop_enable'],
                 components['slider_conv_loop_width'], components['slider_conv_loop_length'],
                 components['slider_conv_loop_hole'], components['slider_conv_loop_angle'],
                 lang_state
             ],
-            outputs=[conv_preview, conv_preview_cache, conv_palette_html, conv_replacement_map, conv_replacement_history, components['textbox_conv_status']]
+            outputs=[conv_preview, conv_preview_cache, conv_palette_html, conv_replacement_regions, conv_replacement_history, components['textbox_conv_status']]
+    ).then(
+            fn=lambda: (None, None),
+            inputs=[],
+            outputs=[conv_selected_user_row_id, conv_selected_auto_row_id]
     )
+
     
     # Color replacement: Undo last replacement
-    def on_undo_color_replacement_with_fit(cache, replacement_map, replacement_history,
+    def on_undo_color_replacement_with_fit(cache, replacement_regions, replacement_history,
                                            loop_pos, add_loop, loop_width, loop_length,
                                            loop_hole, loop_angle, lang_state_val):
-        display, updated_cache, palette_html, new_map, new_history, status = on_undo_color_replacement(
-            cache, replacement_map, replacement_history,
+        display, updated_cache, palette_html, new_regions, new_history, status = on_undo_color_replacement(
+            cache, replacement_regions, replacement_history,
             loop_pos, add_loop, loop_width, loop_length,
             loop_hole, loop_angle, lang_state_val
         )
-        return _preview_update(display), updated_cache, palette_html, new_map, new_history, status
+        return _preview_update(display), updated_cache, palette_html, new_regions, new_history, status
 
     conv_undo_replacement.click(
             on_undo_color_replacement_with_fit,
             inputs=[
-                conv_preview_cache, conv_replacement_map, conv_replacement_history,
+                conv_preview_cache, conv_replacement_regions, conv_replacement_history,
                 conv_loop_pos, components['checkbox_conv_loop_enable'],
                 components['slider_conv_loop_width'], components['slider_conv_loop_length'],
                 components['slider_conv_loop_hole'], components['slider_conv_loop_angle'],
                 lang_state
             ],
-            outputs=[conv_preview, conv_preview_cache, conv_palette_html, conv_replacement_map, conv_replacement_history, components['textbox_conv_status']]
+            outputs=[conv_preview, conv_preview_cache, conv_palette_html, conv_replacement_regions, conv_replacement_history, components['textbox_conv_status']]
+    ).then(
+            fn=lambda: (None, None),
+            inputs=[],
+            outputs=[conv_selected_user_row_id, conv_selected_auto_row_id]
     )
+
     
     # Color replacement: Clear all replacements
-    def on_clear_color_replacements_with_fit(cache, replacement_map, replacement_history,
+    def on_clear_color_replacements_with_fit(cache, replacement_regions, replacement_history,
                                              loop_pos, add_loop, loop_width, loop_length,
                                              loop_hole, loop_angle, lang_state_val):
-        display, updated_cache, palette_html, new_map, new_history, status = on_clear_color_replacements(
-            cache, replacement_map, replacement_history,
+        display, updated_cache, palette_html, new_regions, new_history, status = on_clear_color_replacements(
+            cache, replacement_regions, replacement_history,
             loop_pos, add_loop, loop_width, loop_length,
             loop_hole, loop_angle, lang_state_val
         )
-        return _preview_update(display), updated_cache, palette_html, new_map, new_history, status
+        return _preview_update(display), updated_cache, palette_html, new_regions, new_history, status
 
     conv_clear_replacements.click(
             on_clear_color_replacements_with_fit,
             inputs=[
-                conv_preview_cache, conv_replacement_map, conv_replacement_history,
+                conv_preview_cache, conv_replacement_regions, conv_replacement_history,
                 conv_loop_pos, components['checkbox_conv_loop_enable'],
                 components['slider_conv_loop_width'], components['slider_conv_loop_length'],
                 components['slider_conv_loop_hole'], components['slider_conv_loop_angle'],
                 lang_state
             ],
-            outputs=[conv_preview, conv_preview_cache, conv_palette_html, conv_replacement_map, conv_replacement_history, components['textbox_conv_status']]
+            outputs=[conv_preview, conv_preview_cache, conv_palette_html, conv_replacement_regions, conv_replacement_history, components['textbox_conv_status']]
     )
+
 
     # ========== Free Color (自由色) Event Handlers ==========
     def _render_free_color_html(free_set):
@@ -3098,7 +3416,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
 
     def on_mark_free_color(selected_color, free_set):
         if not selected_color:
-            return free_set, gr.update(), "❌ 请先点击预览图选择一个颜色"
+            return free_set, gr.update(), "[ERROR] 请先点击预览图选择一个颜色"
         new_set = set(free_set) if free_set else set()
         hex_c = selected_color.lower()
         if hex_c in new_set:
@@ -3110,7 +3428,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         return new_set, _render_free_color_html(new_set), msg
 
     def on_clear_free_colors(free_set):
-        return set(), "", "✅ 已清除所有自由色标记"
+        return set(), "", "[OK] 已清除所有自由色标记"
 
     conv_free_color_btn.click(
         on_mark_free_color,
@@ -3229,30 +3547,53 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     # ========== END Color Merging ==========
 
     # [修改] 预览图点击事件同步到 UI
-    def on_preview_click_sync_ui(cache, evt: gr.SelectData):
+    def on_preview_click_sync_ui(cache, evt: gr.SelectData, lut_path):
+        from ui.palette_extension import generate_dual_recommendations_html, build_selected_dual_color_html
+
         img, display_text, hex_val, msg = on_preview_click_select_color(cache, evt)
-        if hex_val is None:
-            return _preview_update(img), gr.update(), gr.update(), msg
-        return _preview_update(img), hex_val, hex_val, msg
+        if hex_val is None or not isinstance(hex_val, str):
+            return _preview_update(img), gr.update(), gr.update(), gr.update(), msg
+
+        rec_html = ""
+        try:
+            if lut_path and cache is not None:
+                q_hex = cache.get('selected_quantized_hex')
+                m_hex = cache.get('selected_matched_hex')
+                if q_hex and m_hex:
+                    lut_colors = get_lut_color_choices(lut_path)
+                    rec = _build_dual_recommendations(
+                        tuple(int(q_hex[i:i+2], 16) for i in (1, 3, 5)),
+                        tuple(int(m_hex[i:i+2], 16) for i in (1, 3, 5)),
+                        lut_colors,
+                        top_k=10
+                    )
+                    rec_html = generate_dual_recommendations_html(rec, lang=lang)
+        except Exception as e:
+            print(f"[DUAL_RECOMMEND] Failed: {e}")
+
+        display_hex, state_hex = _resolve_click_selection_hexes(cache, hex_val)
+        selected_html = build_selected_dual_color_html(state_hex, display_hex, lang=lang)
+        return _preview_update(img), selected_html, state_hex, rec_html, msg
 
     # Relief mode: update slider when color is selected
     def on_color_selected_for_relief(hex_color, enable_relief, height_map, base_thickness):
         """When user clicks a color in preview, update relief slider"""
         if not enable_relief or not hex_color:
-            return gr.update(visible=False), hex_color
-        
+            return gr.update(visible=False), hex_color, hex_color
+
         # Get current height for this color (default to base thickness)
         current_height = height_map.get(hex_color, base_thickness)
-        
-        return gr.update(visible=True, value=current_height), hex_color
+
+        return gr.update(visible=True, value=current_height), hex_color, hex_color
 
     conv_preview.select(
             fn=on_preview_click_sync_ui,
-            inputs=[conv_preview_cache],
+            inputs=[conv_preview_cache, conv_lut_path],
             outputs=[
                 conv_preview,
                 conv_selected_display,
                 conv_selected_color,
+                conv_dual_recommend_html,
                 components['textbox_conv_status']
             ]
     ).then(
@@ -3266,7 +3607,8 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         ],
         outputs=[
             components['slider_conv_relief_height'],
-            conv_relief_selected_color
+            conv_relief_selected_color,
+            conv_selected_color
         ]
     )
     def update_preview_with_loop_with_fit(cache, loop_pos, add_loop,
@@ -3470,18 +3812,101 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     )
     # ========== END Heightmap Upload/Clear Handlers ==========
     
+    def on_color_trigger_sync_ui(selected_hex, highlight_hex, cache, lut_path,
+                                 replacement_regions, selected_user_row_id, selected_auto_row_id,
+                                 loop_pos, add_loop, loop_width, loop_length, loop_hole, loop_angle,
+                                 enable_relief, height_map, base_thickness):
+        from ui.palette_extension import generate_dual_recommendations_html, build_selected_dual_color_html
+
+        if not selected_hex:
+            return gr.update(), gr.update(), gr.update(), gr.update(), cache, gr.update(), gr.update(), gr.update()
+
+        q_hex = selected_hex.strip().lower()
+        m_hex = (highlight_hex or selected_hex).strip().lower()
+
+        new_cache = cache.copy() if isinstance(cache, dict) else {}
+        new_cache['selection_scope'] = 'global'
+        new_cache['selected_region_mask'] = None
+        new_cache['selected_quantized_hex'] = q_hex
+        new_cache['selected_matched_hex'] = m_hex
+
+        if (selected_user_row_id or '').startswith('user::') and replacement_regions:
+            rows = []
+            for item in replacement_regions or []:
+                qv = (item.get('quantized') or item.get('source') or '').lower()
+                mv = (item.get('matched') or item.get('source') or '').lower()
+                rv = (item.get('replacement') or '').lower()
+                if not qv or not rv:
+                    continue
+                rows.append({'quantized': qv, 'matched': mv, 'replacement': rv, 'mask': item.get('mask')})
+
+            indexed = []
+            for idx, row in enumerate(rows):
+                rr = dict(row)
+                rr['row_id'] = f"user::{rr['quantized']}|{rr['matched']}|{rr['replacement']}|{idx}"
+                indexed.append(rr)
+
+            hit = next((r for r in indexed if r.get('row_id') == selected_user_row_id), None)
+            mask = hit.get('mask') if isinstance(hit, dict) else None
+            if mask is not None:
+                new_cache['selection_scope'] = 'region'
+                new_cache['selected_region_mask'] = mask
+
+        display, _ = on_highlight_color_change(
+            m_hex, new_cache, loop_pos, add_loop, loop_width, loop_length, loop_hole, loop_angle
+        )
+
+        rec_html = ""
+        try:
+            if lut_path and q_hex and m_hex:
+                lut_colors = get_lut_color_choices(lut_path)
+                rec = _build_dual_recommendations(
+                    tuple(int(q_hex[i:i+2], 16) for i in (1, 3, 5)),
+                    tuple(int(m_hex[i:i+2], 16) for i in (1, 3, 5)),
+                    lut_colors,
+                    top_k=10
+                )
+                rec_html = generate_dual_recommendations_html(rec, lang=lang)
+        except Exception as e:
+            print(f"[DUAL_RECOMMEND] Failed: {e}")
+
+        display_hex, state_hex = _resolve_click_selection_hexes(new_cache, q_hex)
+        selected_html = build_selected_dual_color_html(state_hex, display_hex, lang=lang)
+        relief_slider, relief_selected_color, _ = on_color_selected_for_relief(
+            state_hex, enable_relief, height_map, base_thickness
+        )
+        return _preview_update(display), selected_html, state_hex, rec_html, new_cache, gr.update(), relief_slider, relief_selected_color
+
     # Hook into existing color selection event (when user clicks palette swatch or uses color trigger button)
     conv_color_trigger_btn.click(
-        on_color_selected_for_relief,
+        fn=on_color_trigger_sync_ui,
         inputs=[
             conv_color_selected_hidden,
+            conv_highlight_color_hidden,
+            conv_preview_cache,
+            conv_lut_path,
+            conv_replacement_regions,
+            conv_selected_user_row_id,
+            conv_selected_auto_row_id,
+            conv_loop_pos,
+            components['checkbox_conv_loop_enable'],
+            components['slider_conv_loop_width'],
+            components['slider_conv_loop_length'],
+            components['slider_conv_loop_hole'],
+            components['slider_conv_loop_angle'],
             components['checkbox_conv_relief_mode'],
             conv_color_height_map,
-            components['slider_conv_thickness']
+            components['slider_conv_thickness'],
         ],
         outputs=[
+            conv_preview,
+            conv_selected_display,
+            conv_selected_color,
+            conv_dual_recommend_html,
+            conv_preview_cache,
+            components['textbox_conv_status'],
             components['slider_conv_relief_height'],
-            conv_relief_selected_color
+            conv_relief_selected_color,
         ]
     )
     
@@ -3587,7 +4012,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 print(f"[AUTO-PREVIEW] Preview generated: {status}")
             except Exception as e:
                 print(f"[AUTO-PREVIEW] Failed to generate preview: {e}")
-                return None, None, None, f"❌ 预览生成失败: {e}"
+                return None, None, None, f"[ERROR] 预览生成失败: {e}"
         
         # Now generate 3MF with the cache
         progress(0.3, desc="生成3MF模型中... | Generating 3MF model...")
@@ -3624,7 +4049,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 conv_loop_pos,
                 components['radio_conv_modeling_mode'],
                 components['slider_conv_quantize_colors'],
-                conv_replacement_map,
+                conv_replacement_regions,
                 components['checkbox_conv_separate_backing'],
                 components['checkbox_conv_relief_mode'],
                 conv_color_height_map,
@@ -3729,7 +4154,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                     print(f"[AUTO-SLICER] Preview generated: {status}")
                 except Exception as e:
                     print(f"[AUTO-SLICER] Failed to generate preview: {e}")
-                    return gr.update(), gr.update(), gr.update(), f"❌ 预览生成失败: {e}"
+                    return gr.update(), gr.update(), gr.update(), f"[ERROR] 预览生成失败: {e}"
             
             # Step 2: Generate 3MF model
             print("[AUTO-SLICER] Step 2/2: Generating 3MF model...")
@@ -3748,14 +4173,14 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 print(f"[AUTO-SLICER] 3MF generated: {status}")
             except Exception as e:
                 print(f"[AUTO-SLICER] Failed to generate 3MF: {e}")
-                return gr.update(), gr.update(), gr.update(), f"❌ 3MF生成失败: {e}"
+                return gr.update(), gr.update(), gr.update(), f"[ERROR] 3MF生成失败: {e}"
         
         # Now open in slicer or download
         if slicer_id == "download":
             # Make file component visible so user can download
             if file_obj is not None:
                 return file_obj, gr.update(visible=True), gr.update(), "📥 请点击下方文件下载"
-            return None, gr.update(), gr.update(), "❌ 没有可下载的文件"
+            return None, gr.update(), gr.update(), "[ERROR] 没有可下载的文件"
         
         # Get actual file path from Gradio File object
         actual_path = None
@@ -3766,7 +4191,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 actual_path = file_obj
         
         if not actual_path:
-            return None, gr.update(), gr.update(), "❌ 生成失败，无法打开"
+            return None, gr.update(), gr.update(), "[ERROR] 生成失败，无法打开"
         
         status = open_in_slicer(actual_path, slicer_id)
         return file_obj, gr.update(), gr.update(), status
@@ -3794,7 +4219,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             conv_loop_pos,
             components['radio_conv_modeling_mode'],
             components['slider_conv_quantize_colors'],
-            conv_replacement_map,
+            conv_replacement_regions,
             components['checkbox_conv_separate_backing'],
             components['checkbox_conv_relief_mode'],
             conv_color_height_map,

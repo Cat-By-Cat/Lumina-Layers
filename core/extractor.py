@@ -163,9 +163,9 @@ def run_extraction(img, points, offset_x, offset_y, zoom, barrel, wb, bright, co
         Tuple of (visualization, preview, lut_path, status_message)
     """
     if img is None:
-        return None, None, None, "❌ 请先上传图片"
+        return None, None, None, "[ERROR] 请先上传图片"
     if len(points) != 4:
-        return None, None, None, "❌ 请点击4个角点"
+        return None, None, None, "[ERROR] 请点击4个角点"
     
     # 动态确定网格大小
     if color_mode == "BW (Black & White)" or color_mode == "BW":
@@ -256,7 +256,7 @@ def run_extraction(img, points, offset_x, offset_y, zoom, barrel, wb, bright, co
 
     Stats.increment("extractions")
 
-    return vis, prev, LUT_FILE_PATH, f"✅ 提取完成！({grid_size}x{grid_size}, {total_cells}色) LUT已保存"
+    return vis, prev, LUT_FILE_PATH, f"[OK] 提取完成！({grid_size}x{grid_size}, {total_cells}色) LUT已保存"
 
 
 def probe_lut_cell(lut_path, evt: gr.SelectData):
@@ -268,11 +268,11 @@ def probe_lut_cell(lut_path, evt: gr.SelectData):
         actual_path = lut_path.name
 
     if not actual_path or not os.path.exists(actual_path):
-        return "⚠️ 无数据", None, None
+        return "[WARNING] 无数据", None, None
     try:
         lut = np.load(actual_path)
     except Exception:
-        return "⚠️ 数据损坏", None, None
+        return "[WARNING] 数据损坏", None, None
 
     # 动态获取LUT的实际大小
     lut_height, lut_width = lut.shape[:2]
@@ -306,7 +306,7 @@ def manual_fix_cell(coord, color_input, lut_path=None):
 
     if not coord or not actual_path or not os.path.exists(actual_path):
         print(f"[MANUAL_FIX] Error: coord={coord}, actual_path={actual_path}, exists={os.path.exists(actual_path) if actual_path else False}")
-        return None, "⚠️ 错误"
+        return None, "[WARNING] 错误"
 
     try:
         print(f"[MANUAL_FIX] Loading LUT from: {actual_path}")
@@ -360,9 +360,9 @@ def manual_fix_cell(coord, color_input, lut_path=None):
         
         preview = cv2.resize(lut, (512, 512), interpolation=cv2.INTER_NEAREST)
         print(f"[MANUAL_FIX] Preview shape: {preview.shape}")
-        return preview, "✅ 已修正"
+        return preview, "[OK] 已修正"
     except Exception as e:
         print(f"[MANUAL_FIX] Exception: {e}")
         import traceback
         traceback.print_exc()
-        return None, f"❌ 格式错误: {color_input}"
+        return None, f"[ERROR] 格式错误: {color_input}"

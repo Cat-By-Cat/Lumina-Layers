@@ -40,15 +40,19 @@ import threading
 import webbrowser
 import socket
 import gradio as gr     # type:ignore
+from config import get_tray_runtime_policy
 from ui.layout_new import create_app
 from ui.styles import CUSTOM_CSS
 
-HAS_DISPLAY = os.environ.get("DISPLAY") or os.name == "nt"
-if HAS_DISPLAY:
+ENABLE_TRAY, TRAY_POLICY_REASON = get_tray_runtime_policy()
+LuminaTray = None
+if ENABLE_TRAY:
     try:
         from core.tray import LuminaTray
-    except ImportError:
-        HAS_DISPLAY = False
+    except Exception as e:
+        print(f"⚠️ Warning: Tray module unavailable, disabling tray: {e}")
+        ENABLE_TRAY = False
+        TRAY_POLICY_REASON = f"Tray module unavailable: {e}"
         
 def find_available_port(start_port=7860, max_attempts=1000):
     """Return first free port in [start_port, start_port + max_attempts)."""
@@ -68,11 +72,15 @@ def start_browser(port):
 if __name__ == "__main__":
     try:
         tray = None
-        try:
-            PORT = find_available_port(7860)
-            tray = LuminaTray(port=PORT)
-        except Exception as e:
-            print(f"⚠️ Warning: Failed to initialize tray: {e}")
+        PORT = find_available_port(7860)
+
+        if ENABLE_TRAY and LuminaTray is not None:
+            try:
+                tray = LuminaTray(port=PORT)
+            except Exception as e:
+                print(f"⚠️ Warning: Failed to initialize tray: {e}")
+        else:
+            print(f"[TRAY] {TRAY_POLICY_REASON}")
 
         threading.Thread(target=start_browser, args=(PORT,), daemon=True).start()
         print(f"✨ Lumina Studio is running on http://127.0.0.1:{PORT}")

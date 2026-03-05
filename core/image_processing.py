@@ -511,7 +511,9 @@ class LuminaImageProcessor:
             'pixel_scale': pixel_to_mm_scale,
             'mode_info': {
                 'mode': modeling_mode
-            }
+            },
+            # 统一返回契约：全路径提供 quantized_image
+            'quantized_image': debug_data['quantized_image'] if debug_data is not None else rgb_arr.copy()
         }
         
         # Add debug data (high-fidelity mode only)

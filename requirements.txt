@@ -15,3 +15,4 @@ colormath
 # Native Vector Engine dependencies
 svgelements>=1.9.0
 shapely>=2.0.0
+mapbox-earcut

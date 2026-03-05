@@ -2,6 +2,7 @@
 
 import os
 import sys
+import platform
 from enum import Enum
 
 # Handle PyInstaller bundled resources
@@ -255,3 +256,41 @@ class VectorConfig:
     # Parallel processing
     ENABLE_PARALLEL: bool = False      # Parallel layer processing (experimental)
     MAX_WORKERS: int = 5               # Thread pool size
+
+
+# ========== Runtime Platform Policy ==========
+
+def _env_flag(name: str) -> bool:
+    """Return True for common truthy env var values."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_wsl_runtime() -> bool:
+    """Detect whether current runtime is WSL."""
+    if "WSL_DISTRO_NAME" in os.environ or "WSL_INTEROP" in os.environ:
+        return True
+    try:
+        return "microsoft" in platform.release().lower()
+    except Exception:
+        return False
+
+
+def get_tray_runtime_policy():
+    """Return (enabled, reason) for system tray initialization."""
+    if _env_flag("DISABLE_TRAY"):
+        return False, "Disabled by DISABLE_TRAY environment variable"
+
+    if is_wsl_runtime():
+        return False, "Disabled on WSL environment"
+
+    # Linux desktop tray support is inconsistent across distros/DEs.
+    # Keep it opt-in to avoid startup noise.
+    if sys.platform.startswith("linux"):
+        if _env_flag("ENABLE_TRAY"):
+            return True, "Enabled on Linux via ENABLE_TRAY=1"
+        return False, "Disabled on Linux by default (set ENABLE_TRAY=1 to force)"
+
+    if os.name == "nt" or sys.platform == "darwin":
+        return True, "Enabled on desktop platform"
+
+    return False, f"Disabled on unsupported platform: {sys.platform}"

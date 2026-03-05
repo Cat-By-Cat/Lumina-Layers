@@ -300,6 +300,30 @@ class I18n:
             'zh': '🗑️ 清除所有',
             'en': '🗑️ Clear'
         },
+        'conv_palette_user_replacements_title': {
+            'zh': '用户替换',
+            'en': 'User Replacements'
+        },
+        'conv_palette_auto_pairs_title': {
+            'zh': '自动配准',
+            'en': 'Auto Pairs'
+        },
+        'conv_palette_delete_selected_btn': {
+            'zh': '删除选中',
+            'en': 'Delete Selected'
+        },
+        'conv_palette_delete_selected_empty': {
+            'zh': '❌ 请先选中一项用户替换',
+            'en': '❌ Select one user replacement first'
+        },
+        'conv_palette_user_empty': {
+            'zh': '暂无替换',
+            'en': 'No replacements'
+        },
+        'conv_palette_auto_empty': {
+            'zh': '暂无自动配准',
+            'en': 'No auto pairs'
+        },
         'lut_grid_invalid': {
             'zh': '⚠️ 请先选择一个有效的 LUT 文件',
             'en': '⚠️ Please select a valid LUT file'

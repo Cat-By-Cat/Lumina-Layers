@@ -118,7 +118,7 @@ class LUTManager:
             tuple: (success_flag, message, new_choice_list)
         """
         if uploaded_file is None:
-            return False, "❌ No file selected", cls.get_lut_choices()
+            return False, "[ERROR] No file selected", cls.get_lut_choices()
         
         try:
             # Ensure preset folder exists
@@ -132,7 +132,7 @@ class LUTManager:
             
             # Validate file extension
             if file_extension not in ('.npy', '.npz'):
-                return False, f"❌ Invalid file type: {file_extension}. Only .npy and .npz are supported.", cls.get_lut_choices()
+                return False, f"[ERROR] Invalid file type: {file_extension}. Only .npy and .npz are supported.", cls.get_lut_choices()
             
             # Use custom name or original name
             if custom_name and custom_name.strip():
@@ -164,11 +164,11 @@ class LUTManager:
             
             print(f"[LUT_MANAGER] Saved uploaded LUT: {dest_path}")
             
-            return True, f"✅ LUT saved: {display_name}\nPlease select from dropdown to use", cls.get_lut_choices()
+            return True, f"[OK] LUT saved: {display_name}\nPlease select from dropdown to use", cls.get_lut_choices()
             
         except Exception as e:
             print(f"[LUT_MANAGER] Error saving LUT: {e}")
-            return False, f"❌ Save failed: {e}", cls.get_lut_choices()
+            return False, f"[ERROR] Save failed: {e}", cls.get_lut_choices()
     
     @classmethod
     def delete_lut(cls, display_name):
@@ -184,16 +184,16 @@ class LUTManager:
         file_path = cls.get_lut_path(display_name)
         
         if not file_path:
-            return False, "❌ File not found", cls.get_lut_choices()
+            return False, "[ERROR] File not found", cls.get_lut_choices()
         
         # Only allow deleting files in Custom folder
         if "Custom" not in file_path:
-            return False, "❌ Can only delete custom LUTs", cls.get_lut_choices()
+            return False, "[ERROR] Can only delete custom LUTs", cls.get_lut_choices()
         
         try:
             os.remove(file_path)
             print(f"[LUT_MANAGER] Deleted LUT: {file_path}")
-            return True, f"✅ Deleted: {display_name}", cls.get_lut_choices()
+            return True, f"[OK] Deleted: {display_name}", cls.get_lut_choices()
         except Exception as e:
             print(f"[LUT_MANAGER] Error deleting LUT: {e}")
-            return False, f"❌ Delete failed: {e}", cls.get_lut_choices()
+            return False, f"[ERROR] Delete failed: {e}", cls.get_lut_choices()
