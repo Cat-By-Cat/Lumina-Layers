@@ -7,6 +7,14 @@ Lumina Studio - 高度图加载与处理模块 (Heightmap Loader)
 
 import numpy as np
 import cv2
+from PIL import Image as PILImage
+
+# HEIC/HEIF support (optional dependency)
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 
 
 class HeightmapLoader:
@@ -157,6 +165,15 @@ class HeightmapLoader:
                 'warnings': [],
                 'error': f"❌ 无法读取高度图文件: {heightmap_path} ({e})"
             }
+        
+        # Fallback: cv2 can't decode HEIC/HEIF, use Pillow instead
+        if image is None:
+            try:
+                pil_img = PILImage.open(heightmap_path)
+                image = cv2.cvtColor(np.array(pil_img.convert('RGB')), cv2.COLOR_RGB2BGR)
+            except Exception:
+                pass
+        
         if image is None:
             return {
                 'success': False,
@@ -251,12 +268,20 @@ class HeightmapLoader:
         if contrast_warning:
             warnings_list.append(contrast_warning)
 
-        # Step 5: 灰度值映射为高度矩阵
+        # Step 5: 参数钳位校验
+        if max_relief_height < base_thickness:
+            warnings_list.append(
+                f"WARNING: max_relief_height ({max_relief_height}mm) < base_thickness ({base_thickness}mm), "
+                f"clamping to base_thickness"
+            )
+            max_relief_height = base_thickness
+
+        # Step 6: 灰度值映射为高度矩阵
         height_matrix = HeightmapLoader._map_grayscale_to_height(
             grayscale, max_relief_height, base_thickness
         )
 
-        # Step 6: 计算统计信息
+        # Step 7: 计算统计信息
         stats = {
             'min_mm': float(np.min(height_matrix)),
             'max_mm': float(np.max(height_matrix)),

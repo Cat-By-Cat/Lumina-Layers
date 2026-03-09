@@ -20,7 +20,7 @@ from PIL import Image as PILImage
 from core.i18n import I18n
 from config import ColorSystem, ModelingMode, BedManager
 from utils import Stats, LUTManager
-from core.calibration import generate_calibration_board, generate_smart_board, generate_8color_batch_zip
+from core.calibration import generate_calibration_board, generate_smart_board, generate_8color_batch_zip, generate_5color1444_board
 from core.naming import generate_batch_filename
 from core.extractor import (
     rotate_image,
@@ -57,6 +57,7 @@ from .callbacks import (
     on_extractor_rotate,
     on_extractor_click,
     on_extractor_clear,
+    on_extractor_page_change,
     on_lut_select,
     on_lut_upload_save,
     on_apply_color_replacement,
@@ -68,6 +69,7 @@ from .callbacks import (
     on_clear_highlight,
     run_extraction_wrapper,
     merge_8color_data,
+    merge_5color_extended_data,
     on_merge_lut_select,
     on_merge_execute,
     on_merge_primary_select,
@@ -76,6 +78,13 @@ from .callbacks import (
     on_merge_apply,
     on_merge_revert,
 )
+
+# Supported image file types for Gradio upload components.
+# Centralized list so that adding a new format only requires one change.
+SUPPORTED_IMAGE_FILE_TYPES: list[str] = [
+    ".jpg", ".jpeg", ".png", ".bmp",
+    ".gif", ".webp", ".heic", ".heif",
+]
 
 # Runtime-injected i18n keys (avoids editing core/i18n.py).
 if hasattr(I18n, 'TEXTS'):
@@ -221,6 +230,22 @@ def save_modeling_mode(modeling_mode):
     """Persist the selected modeling mode."""
     val = modeling_mode.value if hasattr(modeling_mode, 'value') else str(modeling_mode)
     _save_user_setting("last_modeling_mode", val)
+
+
+def resolve_height_mode(radio_value: str) -> str:
+    """Map the UI radio selection to the backend ``height_mode`` parameter.
+
+    Args:
+        radio_value: Current value of the height-mode radio button
+                     (e.g. "深色凸起", "浅色凸起", "根据高度图").
+
+    Returns:
+        ``"heightmap"`` when the user selected heightmap mode,
+        ``"color"`` for all colour-based modes.
+    """
+    if radio_value == "根据高度图":
+        return "heightmap"
+    return "color"
 
 
 # ---------- Slicer Integration ----------
@@ -771,6 +796,54 @@ PREVIEW_ZOOM_JS = """
 </script>
 """
 
+# 5-Color Combination click handler JS
+FIVECOLOR_CLICK_JS = """
+<style>
+.hidden-5color-btn {
+    position: absolute !important;
+    left: -9999px !important;
+    top: -9999px !important;
+    width: 1px !important;
+    height: 1px !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
+}
+</style>
+<script>
+(function() {
+    // 防止重复注入
+    if (window._5colorClickHandlerInjected) return;
+    window._5colorClickHandlerInjected = true;
+    
+    console.log('[5-Color] Injecting global click handler');
+    
+    // 使用事件委托监听所有颜色块点击
+    document.addEventListener('click', function(e) {
+        const colorBox = e.target.closest('.color-box-v2');
+        if (!colorBox) return;
+        
+        const idx = colorBox.getAttribute('data-color-idx');
+        if (idx === null) return;
+        
+        console.log('[5-Color] Color box clicked:', idx);
+        
+        // 查找并点击对应的隐藏按钮
+        const btn = document.getElementById('color-btn-' + idx + '-5color');
+        if (btn) {
+            console.log('[5-Color] Triggering button:', btn.id);
+            btn.click();
+        } else {
+            console.error('[5-Color] Button not found:', 'color-btn-' + idx + '-5color');
+        }
+    });
+    
+    console.log('[5-Color] Global click handler installed');
+})();
+</script>
+"""
+
 # ---------- Image size and aspect-ratio helpers ----------
 
 def _get_image_size(img):
@@ -914,6 +987,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
                              add_loop, loop_width, loop_length, loop_hole, loop_pos,
                              modeling_mode, quantize_colors, replacement_regions=None,
                              separate_backing=False, enable_relief=False, color_height_map=None,
+                             height_mode: str = "color",
                              heightmap_path=None, heightmap_max_height=None,
                              enable_cleanup=True,
                              enable_outline=False, outline_width=2.0,
@@ -928,6 +1002,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
         separate_backing: Boolean flag to separate backing as individual object (default: False)
         enable_relief: Boolean flag to enable 2.5D relief mode (default: False)
         color_height_map: Dict mapping hex colors to heights in mm (default: None)
+        height_mode: "color" or "heightmap", determines relief branch selection (default: "color")
         heightmap_path: Optional path to heightmap image file (default: None)
         heightmap_max_height: Optional max height for heightmap mode in mm (default: None)
 
@@ -935,7 +1010,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
         tuple: (file_or_zip_path, model3d_value, preview_image, status_text).
     """
     # Handle None modeling_mode (use default)
-    if modeling_mode is None:
+    if modeling_mode is None or modeling_mode == "none":
         modeling_mode = ModelingMode.HIGH_FIDELITY
     else:
         modeling_mode = ModelingMode(modeling_mode)
@@ -950,6 +1025,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
             color_mode, add_loop, loop_width, loop_length, loop_hole, loop_pos,
             modeling_mode, quantize_colors, replacement_regions, backing_color_name,
             separate_backing, enable_relief, color_height_map,
+            height_mode,
             heightmap_path, heightmap_max_height,
             enable_cleanup,
             enable_outline, outline_width,
@@ -958,7 +1034,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
             enable_coating, coating_height_mm)
 
     if not is_batch:
-        out_path, glb_path, preview_img, status = generate_final_model(
+        out_path, glb_path, preview_img, status, color_recipe_path = generate_final_model(
             image_path=single_image,
             lut_path=lut_path,
             target_width_mm=target_width_mm,
@@ -966,6 +1042,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
             structure_mode=structure_mode,
             auto_bg=auto_bg,
             bg_tol=bg_tol,
+            progress=progress,
             color_mode=color_mode,
             add_loop=add_loop,
             loop_width=loop_width,
@@ -979,6 +1056,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
             separate_backing=separate_backing,
             enable_relief=enable_relief,
             color_height_map=color_height_map,
+            height_mode=height_mode,
             heightmap_path=heightmap_path,
             heightmap_max_height=heightmap_max_height,
             enable_cleanup=enable_cleanup,
@@ -991,7 +1069,7 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
             enable_coating=enable_coating,
             coating_height_mm=coating_height_mm,
         )
-        return out_path, glb_path, _preview_update(preview_img), status
+        return out_path, glb_path, _preview_update(preview_img), status, color_recipe_path
 
     if not batch_files:
         return None, None, None, "[ERROR] 请先上传图片 / Please upload images first"
@@ -1031,8 +1109,8 @@ def process_batch_generation(batch_files, is_batch, single_image, lut_path, targ
             for f in generated_files:
                 zipf.write(f, os.path.basename(f))
         logs.append(f"✅ Batch done: {len(generated_files)} model(s).")
-        return zip_path, None, _preview_update(None), "\n".join(logs)
-    return None, None, _preview_update(None), "[ERROR] Batch failed: no valid models.\n" + "\n".join(logs)
+        return zip_path, None, _preview_update(None), "\n".join(logs), None
+    return None, None, _preview_update(None), "[ERROR] Batch failed: no valid models.\n" + "\n".join(logs), None
 
 
 # ========== Advanced Tab Callbacks ==========
@@ -1050,6 +1128,23 @@ def _update_lut_grid(lut_path, lang, palette_mode="swatch"):
     if palette_mode == "card":
         return generate_lut_card_grid_html(lut_path, lang)
     return generate_lut_grid_html(lut_path, lang)
+
+
+def _detect_and_enforce_structure(lut_path):
+    """Detect color mode from LUT, and enforce structure constraints for 5-Color Extended.
+
+    Returns (color_mode_update, structure_update, relief_update) for three component outputs.
+    """
+    mode = detect_lut_color_mode(lut_path)
+    if mode and "5-Color Extended" in mode:
+        gr.Info("5-Color Extended 模式：自动切换为单面模式，2.5D 浮雕不可用")
+        return mode, gr.update(
+            value=I18n.get('conv_structure_single', 'en'),
+            interactive=False,
+        ), gr.update(value=False, interactive=False)
+    if mode:
+        return mode, gr.update(interactive=True), gr.update(interactive=True)
+    return gr.update(), gr.update(interactive=True), gr.update(interactive=True)
 
 
 def create_app():
@@ -1273,7 +1368,12 @@ console.log('[CROP] Global scripts loaded, openCropModal:', typeof window.openCr
                 components.update(merge_components)
             tab_components['tab_merge'] = tab_merge
             
-            with gr.TabItem(label=I18n.get('tab_about', "zh"), id=5) as tab_about:
+            with gr.TabItem(label="🎨 配色查询 | Color Query", id=5) as tab_5color:
+                from ui.fivecolor_tab_v2 import create_5color_tab_v2
+                create_5color_tab_v2("zh")
+            tab_components['tab_5color'] = tab_5color
+            
+            with gr.TabItem(label=I18n.get('tab_about', "zh"), id=6) as tab_about:
                 about_components = create_about_tab_content("zh")
                 components.update(about_components)
             tab_components['tab_about'] = tab_about
@@ -1404,6 +1504,10 @@ console.log('[CROP] Global scripts loaded, openCropModal:', typeof window.openCr
             fn=_update_lut_grid,
             inputs=[components['state_conv_lut_path'], lang_state, components['state_conv_palette_mode']],
             outputs=[components['conv_lut_grid_view']]
+        ).then(
+            fn=_detect_and_enforce_structure,
+            inputs=[components['state_conv_lut_path']],
+            outputs=[components['radio_conv_color_mode'], components['radio_conv_structure'], components['checkbox_conv_relief_mode']]
         )
 
         # Settings: cache clearing and counter reset
@@ -1417,6 +1521,16 @@ console.log('[CROP] Global scripts loaded, openCropModal:', typeof window.openCr
             new_cache_size = I18n.get('settings_cache_size', lang).format(_format_bytes(cache_size_after))
             return status_msg, new_cache_size
 
+        def on_clear_output(lang):
+            output_size_before = Stats.get_output_size()
+            _, _ = Stats.clear_output()
+            output_size_after = Stats.get_output_size()
+            freed_size = max(output_size_before - output_size_after, 0)
+
+            status_msg = I18n.get('settings_output_cleared', lang).format(_format_bytes(freed_size))
+            new_output_size = I18n.get('settings_output_size', lang).format(_format_bytes(output_size_after))
+            return status_msg, new_output_size
+
         def on_reset_counters(lang):
             Stats.reset_all()
             new_stats = Stats.get_all()
@@ -1429,13 +1543,28 @@ console.log('[CROP] Global scripts loaded, openCropModal:', typeof window.openCr
             return status_msg, _get_stats_html(lang, new_stats)
 
         # ========== Advanced Tab Events ==========
-        # (No events currently)
+        def on_unlock_max_size(unlock: bool):
+            """Toggle max size limit for width/height sliders."""
+            new_max = 9999 if unlock else 400
+            return gr.update(maximum=new_max), gr.update(maximum=new_max)
+
+        components['checkbox_unlock_max_size'].change(
+            on_unlock_max_size,
+            inputs=[components['checkbox_unlock_max_size']],
+            outputs=[components['slider_conv_width'], components['slider_conv_height']]
+        )
 
         # ========== About Tab Events ==========
         components['btn_clear_cache'].click(
             fn=on_clear_cache,
             inputs=[lang_state],
             outputs=[components['md_settings_status'], components['md_cache_size']]
+        )
+
+        components['btn_clear_output'].click(
+            fn=on_clear_output,
+            inputs=[lang_state],
+            outputs=[components['md_settings_status'], components['md_output_size']]
         )
 
         components['btn_reset_counters'].click(
@@ -1577,6 +1706,13 @@ def _get_all_component_updates(lang: str, components: dict) -> list:
         if key == 'btn_clear_cache':
             updates.append(gr.update(value=I18n.get('settings_clear_cache', lang)))
             continue
+        if key == 'md_output_size':
+            output_size = Stats.get_output_size()
+            updates.append(gr.update(value=I18n.get('settings_output_size', lang).format(_format_bytes(output_size))))
+            continue
+        if key == 'btn_clear_output':
+            updates.append(gr.update(value=I18n.get('settings_clear_output', lang)))
+            continue
         if key == 'btn_reset_counters':
             updates.append(gr.update(value=I18n.get('settings_reset_counters', lang)))
             continue
@@ -1627,6 +1763,7 @@ def _get_all_component_updates(lang: str, components: dict) -> list:
                 choices = [
                     ("BW (Black & White)", "BW (Black & White)"),
                     ("4-Color (1024 colors)", "4-Color"),
+                    ("5-Color Extended (2468)", "5-Color Extended"),
                     ("6-Color (Smart 1296)", "6-Color (Smart 1296)"),
                     ("8-Color Max", "8-Color Max"),
                 ]
@@ -1724,11 +1861,12 @@ def _get_component_list(components: dict) -> list:
     return result
 
 
-def get_extractor_reference_image(mode_str):
+def get_extractor_reference_image(mode_str, page_choice="Page 1"):
     """Load or generate reference image for color extractor (disk-cached).
 
     Uses assets/ with filenames ref_bw_standard.png, ref_cmyw_standard.png,
-    ref_rybw_standard.png, ref_6color_smart.png, or ref_8color_smart.png.
+    ref_rybw_standard.png, ref_5color_ext_page1.png, ref_5color_ext_page2.png,
+    ref_6color_smart.png, or ref_8color_smart.png.
     Generates via calibration board logic if missing.
 
     Args:
@@ -1752,9 +1890,15 @@ def get_extractor_reference_image(mode_str):
         os.makedirs(cache_dir, exist_ok=True)
 
     # Determine filename and generation mode based on color system
+    gen_page_idx = 0
     if "8-Color" in mode_str:
         filename = "ref_8color_smart.png"
         gen_mode = "8-Color"
+    elif "5-Color Extended" in mode_str:
+        is_page2 = page_choice is not None and "2" in str(page_choice)
+        filename = "ref_5color_ext_page2.png" if is_page2 else "ref_5color_ext_page1.png"
+        gen_mode = "5-Color Extended"
+        gen_page_idx = 1 if is_page2 else 0
     elif "6-Color" in mode_str or "1296" in mode_str:
         filename = "ref_6color_smart.png"
         gen_mode = "6-Color"
@@ -1804,6 +1948,9 @@ def get_extractor_reference_image(mode_str):
         if gen_mode == "8-Color":
             from core.calibration import generate_8color_board
             _, img, _ = generate_8color_board(0)  # Page 1
+        elif gen_mode == "5-Color Extended":
+            from core.calibration import generate_5color_extended_board
+            _, img, _ = generate_5color_extended_board(block_size, gap, page_index=gen_page_idx)
         elif gen_mode == "6-Color":
             from core.calibration import generate_smart_board
             _, img, _ = generate_smart_board(block_size, gap)
@@ -1942,12 +2089,12 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 image_mode=None,  # Auto-detect mode to support both JPEG and PNG
                 height=400,
                 visible=True,
-                elem_id="conv-image-input"
+                elem_id="conv-image-input",
             )
             components['file_conv_batch_input'] = gr.File(
                 label=I18n.get('conv_batch_input', lang),
                 file_count="multiple",
-                file_types=["image"],
+                file_types=SUPPORTED_IMAGE_FILE_TYPES,
                 visible=False
             )
             components['md_conv_params_section'] = gr.Markdown(I18n.get('conv_params_section', lang))
@@ -1994,8 +2141,8 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             components['slider_conv_auto_height_max'] = gr.Slider(
                 minimum=0.08,
                 maximum=15.0,
-                value=5.0,
-                step=0.1,
+                value=2.4,
+                step=0.08,
                 label="最大浮雕高度 | Max Relief Height (mm)",
                 info="所有颜色的最大高度（相对于底板）",
                 visible=False
@@ -2023,11 +2170,11 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 with gr.Row(visible=False) as conv_heightmap_row:
                     components['image_conv_heightmap'] = gr.Image(
                         type="filepath",
-                        label="上传高度图 | Upload Heightmap (PNG/JPG/BMP)",
+                        label="上传高度图 | Upload Heightmap (PNG/JPG/BMP/HEIC)",
                         visible=True,
                         height=200,
                         sources=["upload"],
-                        interactive=True
+                        interactive=True,
                     )
                     components['image_conv_heightmap_preview'] = gr.Image(
                         label="高度图预览 | Heightmap Preview",
@@ -2054,6 +2201,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                     choices=[
                         ("BW (Black & White)", "BW (Black & White)"),
                         ("4-Color (1024 colors)", "4-Color"),
+                        ("5-Color Extended (2468)", "5-Color Extended"),
                         ("6-Color (Smart 1296)", "6-Color (Smart 1296)"),
                         ("8-Color Max", "8-Color Max"),
                         ("🔀 Merged", "Merged"),
@@ -2508,7 +2656,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                             value=False
                         )
                     components['slider_conv_coating_height'] = gr.Slider(
-                        0.04, 0.12, 0.08, step=0.04,
+                        0.08, 0.16, 0.08, step=0.08,
                         label=I18n.get('conv_coating_height', lang)
                     )
                     # ========== END Coating Settings ==========
@@ -2569,6 +2717,13 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                         label=I18n.get('conv_download_file', lang),
                         visible=_show_file
                     )
+                    
+                    # Color recipe log download
+                    components['file_conv_color_recipe'] = gr.File(
+                        label="颜色配方日志 / Color Recipe Log",
+                        visible=_show_file
+                    )
+                    
                     components['btn_conv_stop'] = gr.Button(
                         value=I18n.get('conv_stop', lang),
                         variant="stop",
@@ -2689,22 +2844,49 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         return 0, 0
 
     def on_image_upload_process_with_html(image_path):
-        """When image is uploaded, process and prepare for crop modal (不分析颜色)"""
+        """When image is uploaded, process and prepare for crop modal (不分析颜色).
+        For HEIC/HEIF files, returns the converted PNG path back to the Image
+        component so the browser can render it (browsers cannot display HEIC).
+        """
         if image_path is None:
             return (
                 0, 0, None,
-                '<div id="preprocess-dimensions-data" data-width="0" data-height="0" data-is-svg="0" style="display:none;"></div>'
+                '<div id="preprocess-dimensions-data" data-width="0" data-height="0" data-is-svg="0" style="display:none;"></div>',
+                None,
             )
         
         try:
-            # SVG: bypass PIL-based preprocessor to avoid "cannot identify image file" noise.
+            # SVG: Gradio's gr.Image stores SVG as base64 data-URL internally, but the
+            # base64 decode fails on subsequent events (binascii.Error: Incorrect padding).
+            # Fix: render the SVG to a temp PNG for display in gr.Image, while keeping the
+            # original SVG path in preprocess_processed_path for the vector converter.
             if isinstance(image_path, str) and image_path.lower().endswith(".svg"):
                 width, height = _parse_svg_dimensions(image_path)
                 dimensions_html = (
                     f'<div id="preprocess-dimensions-data" data-width="{width}" '
                     f'data-height="{height}" data-is-svg="1" style="display:none;"></div>'
                 )
-                return (width, height, image_path, dimensions_html)
+                # Try to render SVG → PNG so gr.Image gets a safe raster file
+                display_path = gr.update()
+                try:
+                    from svglib.svglib import svg2rlg
+                    from reportlab.graphics import renderPM
+                    import tempfile, os as _os
+                    drawing = svg2rlg(image_path)
+                    if drawing is not None:
+                        tmp_png = tempfile.NamedTemporaryFile(
+                            suffix=".png", delete=False,
+                            dir=_os.path.dirname(image_path)
+                        )
+                        tmp_png.close()
+                        renderPM.drawToFile(drawing, tmp_png.name, fmt="PNG")
+                        display_path = tmp_png.name
+                        print(f"[SVG_UPLOAD] Rendered SVG preview → {tmp_png.name}")
+                except Exception as render_err:
+                    print(f"[SVG_UPLOAD] Could not render SVG preview: {render_err}")
+                # preprocess_processed_path keeps the original SVG for the converter;
+                # image_conv_image_label gets the PNG (or unchanged) to avoid base64 errors.
+                return (width, height, image_path, dimensions_html, display_path)
 
             info = ImagePreprocessor.process_upload(image_path)
             # 不在这里分析颜色，等用户确认裁剪后再分析
@@ -2712,10 +2894,13 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 f'<div id="preprocess-dimensions-data" data-width="{info.width}" '
                 f'data-height="{info.height}" data-is-svg="0" style="display:none;"></div>'
             )
-            return (info.width, info.height, info.processed_path, dimensions_html)
+            # If the image was converted (e.g. HEIC→PNG), feed the PNG back to
+            # the Image component so the browser can actually render it.
+            display_path = info.processed_path if info.was_converted else gr.update()
+            return (info.width, info.height, info.processed_path, dimensions_html, display_path)
         except Exception as e:
             print(f"Image upload error: {e}")
-            return (0, 0, None, '<div id="preprocess-dimensions-data" data-width="0" data-height="0" data-is-svg="0" style="display:none;"></div>')
+            return (0, 0, None, '<div id="preprocess-dimensions-data" data-width="0" data-height="0" data-is-svg="0" style="display:none;"></div>', gr.update())
     
     # JavaScript to open crop modal (不传递颜色推荐，弹窗中不显示)
     # Check if crop modal is enabled before opening
@@ -2828,7 +3013,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     components['image_conv_image_label'].upload(
         on_image_upload_process_with_html,
         inputs=[components['image_conv_image_label']],
-        outputs=[preprocess_img_width, preprocess_img_height, preprocess_processed_path, preprocess_dimensions_html]
+        outputs=[preprocess_img_width, preprocess_img_height, preprocess_processed_path, preprocess_dimensions_html, components['image_conv_image_label']]
     ).then(
         fn=None,
         inputs=None,
@@ -2960,12 +3145,11 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             inputs=[conv_lut_path, lang_state, conv_palette_mode],
             outputs=[conv_lut_grid_view]
     ).then(
-            # 自动检测并切换颜色模式
-            fn=detect_lut_color_mode,
+            fn=_detect_and_enforce_structure,
             inputs=[conv_lut_path],
-            outputs=[components['radio_conv_color_mode']]
+            outputs=[components['radio_conv_color_mode'], components['radio_conv_structure'], components['checkbox_conv_relief_mode']]
     )
-    
+
 
     
 
@@ -2978,10 +3162,9 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             fn=lambda: gr.update(),
             outputs=[components['dropdown_conv_lut_dropdown']]
     ).then(
-            # 自动检测并切换颜色模式
-            fn=lambda lut_file: detect_lut_color_mode(lut_file.name if lut_file else None) or gr.update(),
+            fn=lambda lut_file: _detect_and_enforce_structure(lut_file.name if lut_file else None),
             inputs=[conv_lut_upload],
-            outputs=[components['radio_conv_color_mode']]
+            outputs=[components['radio_conv_color_mode'], components['radio_conv_structure'], components['checkbox_conv_relief_mode']]
     )
     
     components['image_conv_image_label'].change(
@@ -2990,9 +3173,17 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             outputs=[components['slider_conv_width'], conv_target_height_mm]
     ).then(
             # 自动检测图像类型并切换建模模式
+            # 使用 preprocess_processed_path 而非 image_conv_image_label，
+            # 因为 SVG 上传后 image_conv_image_label 存的是 PNG 缩略图，
+            # 只有 preprocess_processed_path 保留原始 SVG 路径。
             fn=detect_image_type,
-            inputs=[components['image_conv_image_label']],
+            inputs=[preprocess_processed_path],
             outputs=[components['radio_conv_modeling_mode']]
+    ).then(
+            # 清空已生成的 3MF 文件，强制下次点击切片按钮时重新生成
+            fn=lambda: None,
+            inputs=None,
+            outputs=[components['file_conv_download_file']]
     )
     components['slider_conv_width'].input(
             fn=calc_height_from_width,
@@ -3007,7 +3198,11 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     def generate_preview_cached_with_fit(image_path, lut_path, target_width_mm,
                                          auto_bg, bg_tol, color_mode,
                                          modeling_mode, quantize_colors, enable_cleanup,
-                                         is_dark_theme=False):
+                                         is_dark_theme=False, processed_path=None):
+        # When SVG was uploaded, image_conv_image_label holds a PNG thumbnail while
+        # preprocess_processed_path holds the original SVG. Use SVG for the converter.
+        if processed_path and isinstance(processed_path, str) and processed_path.lower().endswith('.svg'):
+            image_path = processed_path
         display, cache, status = generate_preview_cached(
             image_path, lut_path, target_width_mm,
             auto_bg, bg_tol, color_mode,
@@ -3116,6 +3311,23 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         outputs=None
     )
 
+    def _on_color_mode_update_structure(color_mode):
+        """5-Color Extended requires single-sided face-up (max 4 materials per Z layer).
+        Also disables 2.5D relief mode which is incompatible with 5-Color Extended.
+        """
+        if color_mode and "5-Color Extended" in color_mode:
+            return gr.update(
+                value=I18n.get('conv_structure_single', 'en'),
+                interactive=False,
+            ), gr.update(value=False, interactive=False)
+        return gr.update(interactive=True), gr.update(interactive=True)
+
+    components['radio_conv_color_mode'].change(
+        fn=_on_color_mode_update_structure,
+        inputs=[components['radio_conv_color_mode']],
+        outputs=[components['radio_conv_structure'], components['checkbox_conv_relief_mode']],
+    )
+
     preview_event = components['btn_conv_preview_btn'].click(
             generate_preview_cached_with_fit,
             inputs=[
@@ -3128,7 +3340,8 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 components['radio_conv_modeling_mode'],
                 components['slider_conv_quantize_colors'],
                 components['checkbox_conv_cleanup'],
-                theme_state
+                theme_state,
+                preprocess_processed_path,
             ],
             outputs=[conv_preview, conv_preview_cache, components['textbox_conv_status'], conv_3d_preview]
     ).then(
@@ -3576,15 +3789,30 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         return _preview_update(img), selected_html, state_hex, rec_html, msg
 
     # Relief mode: update slider when color is selected
-    def on_color_selected_for_relief(hex_color, enable_relief, height_map, base_thickness):
-        """When user clicks a color in preview, update relief slider"""
+    def on_color_selected_for_relief(hex_color, enable_relief, height_map, base_thickness, cache):
+        """When user clicks a color in preview, update relief slider.
+        用户点击预览图选色后，更新浮雕高度 slider。
+
+        Args:
+            hex_color (str | None): Quantized hex from click selection. (点击选中的量化色 hex)
+            enable_relief (bool): Whether relief mode is enabled. (浮雕模式是否开启)
+            height_map (dict): Color-to-height mapping keyed by matched hex. (matched hex 为 key 的颜色高度映射)
+            base_thickness (float): Base thickness fallback in mm. (底板厚度回退值，单位 mm)
+            cache (dict | None): Preview cache containing selected_matched_hex. (预览缓存，包含 selected_matched_hex)
+
+        Returns:
+            tuple: (slider update, relief_selected_color, selected_color). (slider 更新, 浮雕选中色, 选中色)
+        """
         if not enable_relief or not hex_color:
             return gr.update(visible=False), hex_color, hex_color
 
-        # Get current height for this color (default to base thickness)
-        current_height = height_map.get(hex_color, base_thickness)
+        # Use matched hex (same key space as color_height_map) for lookup
+        matched_hex = (cache or {}).get('selected_matched_hex', hex_color) if cache else hex_color
+        current_height = height_map.get(matched_hex, base_thickness)
 
-        return gr.update(visible=True, value=current_height), hex_color, hex_color
+        # Store matched_hex in conv_relief_selected_color so slider edits
+        # write back with the correct key
+        return gr.update(visible=True, value=current_height), matched_hex, hex_color
 
     conv_preview.select(
             fn=on_preview_click_sync_ui,
@@ -3603,7 +3831,8 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             conv_selected_color,
             components['checkbox_conv_relief_mode'],
             conv_color_height_map,
-            components['slider_conv_thickness']
+            components['slider_conv_thickness'],
+            conv_preview_cache
         ],
         outputs=[
             components['slider_conv_relief_height'],
@@ -3662,9 +3891,10 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         - conv_relief_selected_color
         - radio_conv_auto_height_mode (reset to default)
         - checkbox_conv_cloisonne_enable (auto-disable)
+        - image_conv_heightmap (clear on disable)
         """
         if not enable_relief:
-            # 关闭浮雕模式 - 隐藏所有浮雕相关控件
+            # 关闭浮雕模式 - 隐藏所有浮雕相关控件，清除 heightmap 残留值
             return (
                 gr.update(visible=False),   # slider_conv_relief_height
                 gr.update(visible=False),   # accordion_conv_auto_height
@@ -3675,6 +3905,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 None,                       # conv_relief_selected_color
                 gr.update(value="深色凸起"), # radio_conv_auto_height_mode reset
                 gr.update(),                # checkbox_conv_cloisonne_enable (no change)
+                gr.update(value=None),      # image_conv_heightmap（清除）
             )
         else:
             # 开启浮雕模式 - 默认「深色凸起」，隐藏高度图上传区，自动关闭掐丝珐琅
@@ -3691,6 +3922,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                     selected_color,             # conv_relief_selected_color
                     gr.update(value="深色凸起"), # radio_conv_auto_height_mode reset
                     gr.update(value=False),     # checkbox_conv_cloisonne_enable (disable)
+                    gr.update(),                # image_conv_heightmap（不变）
                 )
             else:
                 return (
@@ -3703,6 +3935,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                     selected_color,             # conv_relief_selected_color
                     gr.update(value="深色凸起"), # radio_conv_auto_height_mode reset
                     gr.update(value=False),     # checkbox_conv_cloisonne_enable (disable)
+                    gr.update(),                # image_conv_heightmap（不变）
                 )
 
     def on_cloisonne_mode_toggle(enable_cloisonne):
@@ -3729,7 +3962,8 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             conv_color_height_map,
             conv_relief_selected_color,
             components['radio_conv_auto_height_mode'],
-            components['checkbox_conv_cloisonne_enable']
+            components['checkbox_conv_cloisonne_enable'],
+            components['image_conv_heightmap'],
         ]
     )
 
@@ -3744,19 +3978,21 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     )
 
     # ========== Sorting Rule Radio Change Handler ==========
-    def on_height_mode_change(mode):
-        """切换排列规则时，控制高度图上传区和一键生成按钮的显隐。"""
+    def on_height_mode_change(mode: str):
+        """切换排列规则时，控制高度图上传区和一键生成按钮的显隐，并清除残留值。"""
         if mode == "根据高度图":
             return (
                 gr.update(visible=True),    # row_conv_heightmap - 显示高度图上传区
                 gr.update(visible=False),   # btn_conv_auto_height_apply - 隐藏一键生成按钮
                 gr.update(visible=False),   # image_conv_heightmap_preview
+                gr.update(),                # image_conv_heightmap（不变）
             )
         else:
             return (
                 gr.update(visible=False),   # row_conv_heightmap - 隐藏高度图上传区
                 gr.update(visible=True),    # btn_conv_auto_height_apply - 显示一键生成按钮
                 gr.update(visible=False),   # image_conv_heightmap_preview
+                gr.update(value=None),      # image_conv_heightmap（清除）
             )
     
     components['radio_conv_auto_height_mode'].change(
@@ -3766,15 +4002,31 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             components['row_conv_heightmap'],
             components['btn_conv_auto_height_apply'],
             components['image_conv_heightmap_preview'],
+            components['image_conv_heightmap'],
         ]
     )
 
     # ========== Heightmap Upload/Clear Handlers ==========
     def on_heightmap_upload(heightmap_path):
-        """高度图上传回调 - 验证并显示预览。"""
+        """高度图上传回调 - 验证并显示预览。
+        For HEIC/HEIF files, converts to PNG and returns the converted path
+        back to the component so the browser can render it.
+        """
         if not heightmap_path:
             return on_heightmap_clear()
-        
+
+        # Convert HEIC/HEIF to PNG so the browser can display it
+        display_update = gr.update()
+        if isinstance(heightmap_path, str):
+            ext = os.path.splitext(heightmap_path)[1].lower()
+            if ext in ('.heic', '.heif'):
+                try:
+                    converted = ImagePreprocessor.convert_to_png(heightmap_path)
+                    heightmap_path = converted
+                    display_update = converted
+                except Exception as e:
+                    print(f"[HEIC] Heightmap conversion failed: {e}")
+
         result = HeightmapLoader.load_and_validate(heightmap_path)
         
         if result['success']:
@@ -3787,19 +4039,22 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             status_msg = " | ".join(status_parts)
             return (
                 gr.update(visible=True, value=result['thumbnail']),
-                status_msg
+                status_msg,
+                display_update,
             )
         else:
             return (
                 gr.update(visible=False),
-                result['error']
+                result['error'],
+                display_update,
             )
     
     def on_heightmap_clear():
         """高度图移除回调 - 清除预览。"""
         return (
             gr.update(visible=False, value=None),
-            ""
+            "",
+            gr.update(),
         )
     
     components['image_conv_heightmap'].change(
@@ -3807,7 +4062,8 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         inputs=[components['image_conv_heightmap']],
         outputs=[
             components['image_conv_heightmap_preview'],
-            components['textbox_conv_status']
+            components['textbox_conv_status'],
+            components['image_conv_heightmap'],
         ]
     )
     # ========== END Heightmap Upload/Clear Handlers ==========
@@ -3873,7 +4129,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         display_hex, state_hex = _resolve_click_selection_hexes(new_cache, q_hex)
         selected_html = build_selected_dual_color_html(state_hex, display_hex, lang=lang)
         relief_slider, relief_selected_color, _ = on_color_selected_for_relief(
-            state_hex, enable_relief, height_map, base_thickness
+            state_hex, enable_relief, height_map, base_thickness, new_cache
         )
         return _preview_update(display), selected_html, state_hex, rec_html, new_cache, gr.update(), relief_slider, relief_selected_color
 
@@ -3947,17 +4203,25 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         
         matched_rgb = cache['matched_rgb']
         
-        # Extract unique colors (convert to hex)
-        unique_colors = set()
-        h, w = matched_rgb.shape[:2]
-        for y in range(h):
-            for x in range(w):
-                r, g, b = matched_rgb[y, x]
-                # Skip transparent/background pixels (assuming black is background)
-                if r == 0 and g == 0 and b == 0:
-                    continue
-                hex_color = f'#{r:02x}{g:02x}{b:02x}'
-                unique_colors.add(hex_color)
+        # Extract unique colors using mask_solid for background detection
+        # instead of hardcoded (0,0,0) skip
+        mask_solid: np.ndarray | None = cache.get('mask_solid')
+        unique_colors: set[str] = set()
+        
+        if mask_solid is not None:
+            # Vectorized: select only solid (non-background) pixels
+            solid_pixels = matched_rgb[mask_solid]  # shape: (N, 3)
+            if solid_pixels.size > 0:
+                unique_rgb = np.unique(solid_pixels, axis=0)
+                for r, g, b in unique_rgb:
+                    unique_colors.add(f'#{r:02x}{g:02x}{b:02x}')
+        else:
+            # Fallback: no mask_solid available, collect all colors (no black skip)
+            h, w = matched_rgb.shape[:2]
+            flat_pixels = matched_rgb.reshape(-1, 3)
+            unique_rgb = np.unique(flat_pixels, axis=0)
+            for r, g, b in unique_rgb:
+                unique_colors.add(f'#{r:02x}{g:02x}{b:02x}')
         
         if not unique_colors:
             gr.Warning("⚠️ 未找到有效颜色 | No valid colors found")
@@ -3984,7 +4248,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
     )
     # ========== END Relief Mode Event Handlers ==========
     
-    # Wrapper function to auto-generate preview if needed before generating 3MF
+    # Wrapper function for 3MF generation
     def generate_with_auto_preview(batch_files, is_batch, single_image, lut_path, target_width_mm,
                                    spacer_thick, structure_mode, auto_bg, bg_tol, color_mode,
                                    add_loop, loop_width, loop_length, loop_hole, loop_pos,
@@ -3994,34 +4258,32 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                                    enable_cleanup, enable_outline, outline_width,
                                    enable_cloisonne, wire_width_mm, wire_height_mm,
                                    free_color_set, enable_coating, coating_height_mm,
-                                   preview_cache, theme_is_dark, progress=gr.Progress()):
-        """Generate 3MF with auto-preview if cache is missing."""
+                                   radio_height_mode: str,
+                                   preview_cache, theme_is_dark, processed_path=None,
+                                   progress=gr.Progress()):
+        """Generate 3MF directly; preview is generated internally by convert_image_to_3d.
         
-        # Check if preview cache exists
-        if preview_cache is None or not preview_cache:
-            print("[AUTO-PREVIEW] No preview cache found, generating preview first...")
-            progress(0.1, desc="生成预览中... | Generating preview...")
-            
-            # Generate preview first
-            try:
-                preview_img, cache, status, glb = generate_preview_cached_with_fit(
-                    single_image, lut_path, target_width_mm, auto_bg, bg_tol,
-                    color_mode, modeling_mode, quantize_colors, enable_cleanup, theme_is_dark
-                )
-                preview_cache = cache
-                print(f"[AUTO-PREVIEW] Preview generated: {status}")
-            except Exception as e:
-                print(f"[AUTO-PREVIEW] Failed to generate preview: {e}")
-                return None, None, None, f"[ERROR] 预览生成失败: {e}"
-        
-        # Now generate 3MF with the cache
-        progress(0.3, desc="生成3MF模型中... | Generating 3MF model...")
+        Auto-preview pre-run is intentionally removed: it caused a full duplicate
+        image-processing pass (4-35s) with no cache reuse, since preview_cache was
+        never forwarded into process_batch_generation. Lower-level caches (O-3
+        parse+clip, O-4 SVG raster) already prevent redundant work when the user
+        runs preview before clicking this button.
+        """
+        # When SVG was uploaded, image_conv_image_label holds a PNG thumbnail while
+        # preprocess_processed_path holds the original SVG. Use SVG for the converter.
+        if processed_path and isinstance(processed_path, str) and processed_path.lower().endswith('.svg'):
+            single_image = processed_path
+        # Resolve UI radio value to backend height_mode parameter
+        height_mode = resolve_height_mode(radio_height_mode)
+
+        progress(0.0, desc="开始生成... | Starting...")
         return process_batch_generation(
             batch_files, is_batch, single_image, lut_path, target_width_mm,
             spacer_thick, structure_mode, auto_bg, bg_tol, color_mode,
             add_loop, loop_width, loop_length, loop_hole, loop_pos,
             modeling_mode, quantize_colors, color_replacements,
             separate_backing, enable_relief, color_height_map,
+            height_mode,
             heightmap_path, heightmap_max_height,
             enable_cleanup, enable_outline, outline_width,
             enable_cloisonne, wire_width_mm, wire_height_mm,
@@ -4064,14 +4326,17 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 conv_free_color_set,
                 components['checkbox_conv_coating_enable'],
                 components['slider_conv_coating_height'],
+                components['radio_conv_auto_height_mode'],
                 conv_preview_cache,
-                theme_state
+                theme_state,
+                preprocess_processed_path,
             ],
             outputs=[
                 components['file_conv_download_file'],
                 conv_3d_preview,
                 conv_preview,
-                components['textbox_conv_status']
+                components['textbox_conv_status'],
+                components['file_conv_color_recipe']
             ]
     )
     components['conv_event'] = generate_event
@@ -4097,10 +4362,12 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                     gr.update(value=label, elem_classes=[css_cls]),
                     gr.update(elem_classes=[css_cls]),
                     gr.update(visible=show_file),
+                    gr.update(visible=show_file),
                 )
         return (
             gr.update(value="📥 下载 3MF", elem_classes=["slicer-download"]),
             gr.update(elem_classes=["slicer-download"]),
+            gr.update(visible=True),
             gr.update(visible=True),
         )
 
@@ -4111,6 +4378,7 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             components['btn_conv_open_slicer'],
             components['btn_conv_slicer_arrow'],
             components['file_conv_download_file'],
+            components['file_conv_color_recipe'],
         ]
     )
 
@@ -4126,6 +4394,46 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
         outputs=[components['dropdown_conv_slicer'], conv_slicer_dropdown_vis]
     )
 
+    # ========== Invalidate cached 3MF when any generation parameter changes ==========
+    # When user changes image, dimensions, color mode, modeling mode, or any other
+    # parameter that affects the output, clear the cached 3MF file so the slicer
+    # button will trigger a fresh generation instead of opening the stale model.
+    _invalidate_fn = lambda: None  # Returns None to clear file component
+
+    _param_components_change = [
+        components['slider_conv_width'],
+        components['slider_conv_thickness'],
+        components['radio_conv_structure'],
+        components['checkbox_conv_auto_bg'],
+        components['slider_conv_tolerance'],
+        components['radio_conv_color_mode'],
+        components['radio_conv_modeling_mode'],
+        components['slider_conv_quantize_colors'],
+        components['checkbox_conv_loop_enable'],
+        components['slider_conv_loop_width'],
+        components['slider_conv_loop_length'],
+        components['slider_conv_loop_hole'],
+        components['checkbox_conv_separate_backing'],
+        components['checkbox_conv_relief_mode'],
+        components['checkbox_conv_cleanup'],
+        components['checkbox_conv_outline_enable'],
+        components['slider_conv_outline_width'],
+        components['checkbox_conv_cloisonne_enable'],
+        components['slider_conv_wire_width'],
+        components['slider_conv_wire_height'],
+        components['checkbox_conv_coating_enable'],
+        components['slider_conv_coating_height'],
+        components['slider_conv_auto_height_max'],
+        components['radio_conv_auto_height_mode'],
+    ]
+
+    for comp in _param_components_change:
+        comp.change(
+            fn=_invalidate_fn,
+            inputs=None,
+            outputs=[components['file_conv_download_file']]
+        )
+
     def on_open_slicer_click(file_obj, slicer_id, batch_files, is_batch, single_image, lut_path, 
                             target_width_mm, spacer_thick, structure_mode, auto_bg, bg_tol, color_mode,
                             add_loop, loop_width, loop_length, loop_hole, loop_pos,
@@ -4135,8 +4443,20 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                             enable_cleanup, enable_outline, outline_width,
                             enable_cloisonne, wire_width_mm, wire_height_mm,
                             free_color_set, enable_coating, coating_height_mm,
-                            preview_cache, theme_is_dark):
+                            radio_height_mode: str,
+                            preview_cache, theme_is_dark, processed_path=None):
         """Open file in slicer with auto-generation if needed."""
+        
+        # When SVG was uploaded, image_conv_image_label holds a PNG thumbnail while
+        # preprocess_processed_path holds the original SVG. Use SVG for the converter.
+        if processed_path and isinstance(processed_path, str) and processed_path.lower().endswith('.svg'):
+            single_image = processed_path
+
+        # Initialize color_recipe_path to avoid UnboundLocalError
+        color_recipe_path = None
+        
+        # Resolve UI radio value to backend height_mode parameter
+        height_mode = resolve_height_mode(radio_height_mode)
         
         # If no file exists, auto-generate the complete workflow
         if file_obj is None:
@@ -4154,17 +4474,18 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                     print(f"[AUTO-SLICER] Preview generated: {status}")
                 except Exception as e:
                     print(f"[AUTO-SLICER] Failed to generate preview: {e}")
-                    return gr.update(), gr.update(), gr.update(), f"[ERROR] 预览生成失败: {e}"
+                    return gr.update(), gr.update(), gr.update(), gr.update(), f"[ERROR] 预览生成失败: {e}"
             
             # Step 2: Generate 3MF model
             print("[AUTO-SLICER] Step 2/2: Generating 3MF model...")
             try:
-                file_obj, glb, preview_img, status = process_batch_generation(
+                file_obj, glb, preview_img, status, color_recipe_path = process_batch_generation(
                     batch_files, is_batch, single_image, lut_path, target_width_mm,
                     spacer_thick, structure_mode, auto_bg, bg_tol, color_mode,
                     add_loop, loop_width, loop_length, loop_hole, loop_pos,
                     modeling_mode, quantize_colors, color_replacements,
                     separate_backing, enable_relief, color_height_map,
+                    height_mode,
                     heightmap_path, heightmap_max_height,
                     enable_cleanup, enable_outline, outline_width,
                     enable_cloisonne, wire_width_mm, wire_height_mm,
@@ -4173,14 +4494,14 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 print(f"[AUTO-SLICER] 3MF generated: {status}")
             except Exception as e:
                 print(f"[AUTO-SLICER] Failed to generate 3MF: {e}")
-                return gr.update(), gr.update(), gr.update(), f"[ERROR] 3MF生成失败: {e}"
+                return gr.update(), gr.update(), gr.update(), gr.update(), f"[ERROR] 3MF生成失败: {e}"
         
         # Now open in slicer or download
         if slicer_id == "download":
             # Make file component visible so user can download
             if file_obj is not None:
-                return file_obj, gr.update(visible=True), gr.update(), "📥 请点击下方文件下载"
-            return None, gr.update(), gr.update(), "[ERROR] 没有可下载的文件"
+                return file_obj, gr.update(visible=True), color_recipe_path, gr.update(visible=True), "📥 请点击下方文件下载"
+            return None, gr.update(), gr.update(), gr.update(), "[ERROR] 没有可下载的文件"
         
         # Get actual file path from Gradio File object
         actual_path = None
@@ -4191,10 +4512,10 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
                 actual_path = file_obj
         
         if not actual_path:
-            return None, gr.update(), gr.update(), "[ERROR] 生成失败，无法打开"
+            return None, gr.update(), gr.update(), gr.update(), "[ERROR] 生成失败，无法打开"
         
         status = open_in_slicer(actual_path, slicer_id)
-        return file_obj, gr.update(), gr.update(), status
+        return file_obj, gr.update(), color_recipe_path, gr.update(), status
 
     components['btn_conv_open_slicer'].click(
         fn=on_open_slicer_click,
@@ -4234,12 +4555,15 @@ def create_converter_tab_content(lang: str, lang_state=None, theme_state=None) -
             conv_free_color_set,
             components['checkbox_conv_coating_enable'],
             components['slider_conv_coating_height'],
+            components['radio_conv_auto_height_mode'],
             conv_preview_cache,
-            theme_state
+            theme_state,
+            preprocess_processed_path,
         ],
         outputs=[
             components['file_conv_download_file'],
             components['file_conv_download_file'],
+            components['file_conv_color_recipe'],
             conv_3d_preview,
             components['textbox_conv_status']
         ]
@@ -4327,6 +4651,7 @@ def create_calibration_tab_content(lang: str) -> dict:
                 choices=[
                     ("BW (Black & White)", "BW (Black & White)"),
                     ("4-Color (1024 colors)", "4-Color"),
+                    ("5-Color Extended (Dual Page)", "5-Color Extended (Dual Page)"),
                     ("6-Color (Smart 1296)", "6-Color (Smart 1296)"),
                     ("8-Color Max", "8-Color Max")
                 ],
@@ -4378,6 +4703,12 @@ def create_calibration_tab_content(lang: str) -> dict:
         """Wrapper function to call appropriate generator based on mode"""
         if color_mode == "8-Color Max":
             return generate_8color_batch_zip()
+        if color_mode == "5-Color Extended (Dual Page)":
+            from core.calibration import generate_5color_extended_batch_zip
+            return generate_5color_extended_batch_zip()
+        if "5-Color Extended" in color_mode:
+            from core.calibration import generate_5color_extended_board
+            return generate_5color_extended_board(block_size, gap)
         if "6-Color" in color_mode:
             # Call Smart 1296 generator
             return generate_smart_board(block_size, gap)
@@ -4429,17 +4760,26 @@ def create_extractor_tab_content(lang: str) -> dict:
                 choices=[
                     ("BW (Black & White)", "BW (Black & White)"),
                     ("4-Color (1024 colors)", "4-Color"),
+                    ("5-Color Extended (2468)", "5-Color Extended"),
                     ("6-Color (Smart 1296)", "6-Color (Smart 1296)"),
                     ("8-Color Max", "8-Color Max")
                 ],
                 value="4-Color",
                 label=I18n.get('ext_color_mode', lang)
             )
+            
+            # Page selection for dual-page modes (8-Color and 5-Color Extended)
+            components['radio_ext_page'] = gr.Radio(
+                choices=["Page 1", "Page 2"],
+                value="Page 1",
+                label="Page Selection",
+                visible=False
+            )
                 
             ext_img_in = gr.Image(
                 label=I18n.get('ext_photo', lang),
                 type="numpy",
-                interactive=True
+                interactive=True,
             )
                 
             with gr.Row():
@@ -4484,11 +4824,7 @@ def create_extractor_tab_content(lang: str) -> dict:
                 label=I18n.get('ext_offset_y', lang)
             )
             
-            components['radio_ext_page'] = gr.Radio(
-                choices=["Page 1", "Page 2"],
-                value="Page 1",
-                label="8-Color Page"
-            )
+            # Page selection moved above, controlled by color mode
                 
             components['btn_ext_extract_btn'] = gr.Button(
                 I18n.get('ext_extract_btn', lang),
@@ -4497,7 +4833,8 @@ def create_extractor_tab_content(lang: str) -> dict:
             )
             
             components['btn_ext_merge_btn'] = gr.Button(
-                "Merge 8-Color",
+                "Merge Dual Pages",
+                visible=False  # Hidden by default, shown when dual-page mode selected
             )
                 
             components['textbox_ext_status'] = gr.Textbox(
@@ -4562,38 +4899,48 @@ def create_extractor_tab_content(lang: str) -> dict:
     
     ext_img_in.upload(
             on_extractor_upload,
-            [ext_img_in, components['radio_ext_color_mode']],
+            [ext_img_in, components['radio_ext_color_mode'], components['radio_ext_page']],
             [ext_state_img, ext_work_img, ext_state_pts, ext_curr_coord, ext_hint]
     )
     
     components['radio_ext_color_mode'].change(
             on_extractor_mode_change,
-            [ext_state_img, components['radio_ext_color_mode']],
-            [ext_state_pts, ext_hint, ext_work_img]
+            [ext_state_img, components['radio_ext_color_mode'], components['radio_ext_page']],
+            [ext_state_pts, ext_hint, ext_work_img, components['radio_ext_page'], components['btn_ext_merge_btn']]
     )
 
     components['radio_ext_color_mode'].change(
         fn=get_extractor_reference_image,
-        inputs=[components['radio_ext_color_mode']],
+        inputs=[components['radio_ext_color_mode'], components['radio_ext_page']],
         outputs=[ext_ref_view]
     )
 
     components['btn_ext_rotate_btn'].click(
             on_extractor_rotate,
-            [ext_state_img, components['radio_ext_color_mode']],
+            [ext_state_img, components['radio_ext_color_mode'], components['radio_ext_page']],
             [ext_state_img, ext_work_img, ext_state_pts, ext_hint]
     )
     
     ext_work_img.select(
             on_extractor_click,
-            [ext_state_img, ext_state_pts, components['radio_ext_color_mode']],
+            [ext_state_img, ext_state_pts, components['radio_ext_color_mode'], components['radio_ext_page']],
             [ext_work_img, ext_state_pts, ext_hint]
     )
     
     components['btn_ext_reset_btn'].click(
             on_extractor_clear,
-            [ext_state_img, components['radio_ext_color_mode']],
+            [ext_state_img, components['radio_ext_color_mode'], components['radio_ext_page']],
             [ext_work_img, ext_state_pts, ext_hint]
+    )
+
+    components['radio_ext_page'].change(
+            on_extractor_page_change,
+            [ext_state_img, components['radio_ext_color_mode'], components['radio_ext_page']],
+            [ext_state_pts, ext_hint, ext_work_img]
+    ).then(
+        fn=get_extractor_reference_image,
+        inputs=[components['radio_ext_color_mode'], components['radio_ext_page']],
+        outputs=[ext_ref_view]
     )
     
     extract_inputs = [
@@ -4612,9 +4959,17 @@ def create_extractor_tab_content(lang: str) -> dict:
     ext_event = components['btn_ext_extract_btn'].click(run_extraction_wrapper, extract_inputs, extract_outputs)
     components['ext_event'] = ext_event
 
+    # Dynamic merge button handler based on color mode
+    def merge_dual_pages_wrapper(color_mode):
+        """Route to correct merge function based on color mode."""
+        if "5-Color Extended" in color_mode:
+            return merge_5color_extended_data()
+        else:
+            return merge_8color_data()
+
     components['btn_ext_merge_btn'].click(
-            merge_8color_data,
-            inputs=[],
+            merge_dual_pages_wrapper,
+            inputs=[components['radio_ext_color_mode']],
             outputs=[components['file_ext_download_npy'], components['textbox_ext_status']]
     )
     
@@ -4686,23 +5041,39 @@ def create_merge_tab_content(lang: str) -> dict:
 
 
 def create_advanced_tab_content(lang: str) -> dict:
-    """Build Advanced tab content for LUT merging. Returns component dict."""
-    components = {}
-    
-    # Title and description
-    components['md_advanced_title'] = gr.Markdown("### 🔬 高级功能 | Advanced Features" if lang == 'zh' else "### 🔬 Advanced Features")
+    """Build Advanced tab content with independent setting groups.
+    独立分组构建高级设置标签页内容。
 
-    # Palette display mode
-    palette_label = "调色板样式" if lang == "zh" else "Palette Style"
-    palette_swatch = "色块模式" if lang == "zh" else "Swatch Grid"
-    palette_card = "色卡模式" if lang == "zh" else "Card Layout"
-    saved_mode = _load_user_settings().get("palette_mode", "swatch")
-    components['radio_palette_mode'] = gr.Radio(
-        choices=[(palette_swatch, "swatch"), (palette_card, "card")],
-        value=saved_mode,
-        label=palette_label,
-    )
-    
+    Args:
+        lang (str): Language code, 'zh' or 'en'. (语言代码)
+
+    Returns:
+        dict: Gradio component dictionary. (组件字典)
+    """
+    components = {}
+
+    # --- Group 1: Palette display mode ---
+    with gr.Group():
+        palette_label = "调色板样式" if lang == "zh" else "Palette Style"
+        palette_swatch = "色块模式" if lang == "zh" else "Swatch Grid"
+        palette_card = "色卡模式" if lang == "zh" else "Card Layout"
+        saved_mode = _load_user_settings().get("palette_mode", "swatch")
+        components['radio_palette_mode'] = gr.Radio(
+            choices=[(palette_swatch, "swatch"), (palette_card, "card")],
+            value=saved_mode,
+            label=palette_label,
+        )
+
+    # --- Group 2: Unlock max size limit ---
+    with gr.Group():
+        unlock_label = "解除最大尺寸限制" if lang == "zh" else "Unlock Max Size Limit"
+        unlock_info = "开启后，图像转换的宽度/高度滑块将不再限制最大值（默认上限 400mm）" if lang == "zh" else "When enabled, width/height sliders in Image Converter will have no upper limit (default max 400mm)"
+        components['checkbox_unlock_max_size'] = gr.Checkbox(
+            label=unlock_label,
+            value=False,
+            info=unlock_info,
+        )
+
     return components
 
 
@@ -4728,6 +5099,18 @@ def create_about_tab_content(lang: str) -> dict:
             variant="secondary",
             size="sm"
         )
+    
+    output_size = Stats.get_output_size()
+    output_size_str = _format_bytes(output_size)
+    components['md_output_size'] = gr.Markdown(
+        I18n.get('settings_output_size', lang).format(output_size_str)
+    )
+    components['btn_clear_output'] = gr.Button(
+        I18n.get('settings_clear_output', lang),
+        variant="secondary",
+        size="sm"
+    )
+    
     components['md_settings_status'] = gr.Markdown("")
     
     # About page content (from i18n)
@@ -4745,3 +5128,4 @@ def _format_bytes(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
+

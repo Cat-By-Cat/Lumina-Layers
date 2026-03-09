@@ -143,7 +143,7 @@ def test_process_batch_generation_single_accepts_replacement_regions_list(monkey
     def fake_generate_final_model(*args, **kwargs):
         captured['args'] = args
         captured['kwargs'] = kwargs
-        return 'out.3mf', 'preview.glb', None, 'ok'
+        return 'out.3mf', 'preview.glb', None, 'ok', None
 
     monkeypatch.setattr('ui.layout_new.generate_final_model', fake_generate_final_model)
 
@@ -154,7 +154,7 @@ def test_process_batch_generation_single_accepts_replacement_regions_list(monkey
         {'source': '#445566', 'replacement': '#ddeeff'},
     ]
 
-    out_path, glb_path, preview_img, status = process_batch_generation(
+    out_path, glb_path, preview_img, status, color_recipe_path = process_batch_generation(
         batch_files=None,
         is_batch=False,
         single_image='demo.png',
@@ -239,7 +239,7 @@ def test_process_batch_generation_full_pipeline_replacement_regions_affect_previ
         coating_height_mm=0.08,
     )
 
-    base_out, base_glb, base_preview, base_status = process_batch_generation(
+    base_out, base_glb, base_preview, base_status, _ = process_batch_generation(
         replacement_regions=None,
         **common_kwargs,
     )
@@ -247,14 +247,20 @@ def test_process_batch_generation_full_pipeline_replacement_regions_affect_previ
     def preview_value(preview_output):
         if isinstance(preview_output, dict) and preview_output.get('__type__') == 'update':
             return preview_output.get('value')
+        if hasattr(preview_output, 'shape'):
+            return preview_output
         return preview_output
 
     base_preview_value = preview_value(base_preview)
     assert base_preview_value is not None
+    # Ensure we have a real numpy array, not a mock
+    assert hasattr(base_preview_value, 'shape'), (
+        f"Expected numpy array for preview, got {type(base_preview_value)}"
+    )
 
     solid_mask = base_preview_value[:, :, 3] > 0
 
-    replaced_out, replaced_glb, replaced_preview, replaced_status = process_batch_generation(
+    replaced_out, replaced_glb, replaced_preview, replaced_status, _ = process_batch_generation(
         replacement_regions=[{'matched': '#d60040', 'replacement': '#00ff00', 'mask': solid_mask}],
         **common_kwargs,
     )

@@ -71,60 +71,72 @@ def on_lut_upload_save(uploaded_file):
 # Extractor Callbacks
 # ═══════════════════════════════════════════════════════════════
 
-def get_first_hint(mode):
-    """Get first corner point hint based on mode"""
+def _get_corner_labels(mode, page_choice=None):
+    if mode is not None and "5-Color Extended" in mode and page_choice is not None and "2" in str(page_choice):
+        return ["蓝色 (左上)", "红色 (右上)", "黑色 (右下)", "黄色 (左下)"], None
     conf = ColorSystem.get(mode)
-    label_zh = conf['corner_labels'][0]
-    label_en = conf.get('corner_labels_en', conf['corner_labels'])[0]
+    return conf['corner_labels'], conf.get('corner_labels_en', conf['corner_labels'])
+
+
+def get_first_hint(mode, page_choice=None):
+    labels_zh, labels_en = _get_corner_labels(mode, page_choice)
+    label_zh = labels_zh[0]
+    label_en = label_zh if labels_en is None else labels_en[0]
     return f"#### 👉 点击 Click: **{label_zh} / {label_en}**"
 
 
-def get_next_hint(mode, pts_count):
-    """Get next corner point hint based on mode"""
-    conf = ColorSystem.get(mode)
+def get_next_hint(mode, pts_count, page_choice=None):
+    labels_zh, labels_en = _get_corner_labels(mode, page_choice)
     if pts_count >= 4:
         return "#### [OK] Positioning complete! Ready to extract!"
-    label_zh = conf['corner_labels'][pts_count]
-    label_en = conf.get('corner_labels_en', conf['corner_labels'])[pts_count]
+    label_zh = labels_zh[pts_count]
+    label_en = label_zh if labels_en is None else labels_en[pts_count]
     return f"#### 👉 点击 Click: **{label_zh} / {label_en}**"
 
 
-def on_extractor_upload(i, mode):
+def on_extractor_upload(i, mode, page_choice=None):
     """Handle image upload"""
-    hint = get_first_hint(mode)
+    hint = get_first_hint(mode, page_choice)
     return i, i, [], None, hint
 
 
-def on_extractor_mode_change(img, mode):
+def on_extractor_mode_change(img, mode, page_choice=None):
     """Handle color mode change"""
-    hint = get_first_hint(mode)
-    return [], hint, img
+    hint = get_first_hint(mode, page_choice)
+    # Show page selector and merge button for dual-page modes
+    is_dual_page = "8-Color" in mode or "5-Color Extended" in mode
+    return [], hint, img, gr.update(visible=is_dual_page), gr.update(visible=is_dual_page)
 
 
-def on_extractor_rotate(i, mode):
+def on_extractor_rotate(i, mode, page_choice=None):
     """Rotate image"""
     from core.extractor import rotate_image
     if i is None:
-        return None, None, [], get_first_hint(mode)
+        return None, None, [], get_first_hint(mode, page_choice)
     r = rotate_image(i, "Rotate Left 90°")
-    return r, r, [], get_first_hint(mode)
+    return r, r, [], get_first_hint(mode, page_choice)
 
 
-def on_extractor_click(img, pts, mode, evt: gr.SelectData):
+def on_extractor_click(img, pts, mode, page_choice, evt: gr.SelectData):
     """Set corner point by clicking image"""
     from core.extractor import draw_corner_points
     if len(pts) >= 4:
         return img, pts, "#### [OK] 定位完成 Complete!"
     n = pts + [[evt.index[0], evt.index[1]]]
-    vis = draw_corner_points(img, n, mode)
-    hint = get_next_hint(mode, len(n))
+    vis = draw_corner_points(img, n, mode, page_choice)
+    hint = get_next_hint(mode, len(n), page_choice)
     return vis, n, hint
 
 
-def on_extractor_clear(img, mode):
+def on_extractor_clear(img, mode, page_choice=None):
     """Clear corner points"""
-    hint = get_first_hint(mode)
+    hint = get_first_hint(mode, page_choice)
     return img, [], hint
+
+
+def on_extractor_page_change(img, mode, page_choice):
+    hint = get_first_hint(mode, page_choice)
+    return [], hint, img
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -587,15 +599,16 @@ def on_undo_color_replacement(cache, replacement_regions, replacement_history,
 
 
 def run_extraction_wrapper(img, points, offset_x, offset_y, zoom, barrel, wb, bright, color_mode, page_choice):
-    """Wrapper for extraction: supports 8-Color page saving."""
+    """Wrapper for extraction: supports 8-Color and 5-Color Extended page saving."""
     from core.extractor import run_extraction
     
     run_mode = color_mode
     
     vis, prev, lut_path, status = run_extraction(
-        img, points, offset_x, offset_y, zoom, barrel, wb, bright, run_mode
+        img, points, offset_x, offset_y, zoom, barrel, wb, bright, run_mode, page_choice
     )
     
+    # Handle 8-Color dual-page saving
     if "8-Color" in color_mode and lut_path:
         import sys
         # Handle both dev and frozen modes
@@ -616,6 +629,26 @@ def run_extraction_wrapper(img, points, offset_x, offset_y, zoom, barrel, wb, br
             lut_path = temp_path
         except Exception as e:
             print(f"[8-COLOR] Error saving page {page_idx}: {e}")
+    
+    # Handle 5-Color Extended dual-page saving
+    if "5-Color Extended" in color_mode and lut_path:
+        import sys
+        # Handle both dev and frozen modes
+        if getattr(sys, 'frozen', False):
+            assets_dir = os.path.join(os.getcwd(), "assets")
+        else:
+            assets_dir = "assets"
+        
+        os.makedirs(assets_dir, exist_ok=True)
+        page_idx = 1 if "1" in str(page_choice) else 2
+        temp_path = os.path.join(assets_dir, f"temp_5c_ext_page_{page_idx}.npy")
+        try:
+            lut = np.load(lut_path)
+            np.save(temp_path, lut)
+            print(f"[5C-EXT] Saved page {page_idx} to: {temp_path}")
+            lut_path = temp_path
+        except Exception as e:
+            print(f"[5C-EXT] Error saving page {page_idx}: {e}")
     
     return vis, prev, lut_path, status
 
@@ -658,6 +691,48 @@ def merge_8color_data():
         import traceback
         traceback.print_exc()
         return None, f"[ERROR] Merge failed: {e}"
+
+
+def merge_5color_extended_data():
+    """Concatenate two 5-Color Extended pages and save to LUT_FILE_PATH."""
+    import sys
+    # Handle both dev and frozen modes
+    if getattr(sys, 'frozen', False):
+        assets_dir = os.path.join(os.getcwd(), "assets")
+    else:
+        assets_dir = "assets"
+    
+    path1 = os.path.join(assets_dir, "temp_5c_ext_page_1.npy")
+    path2 = os.path.join(assets_dir, "temp_5c_ext_page_2.npy")
+    
+    print(f"[MERGE_5C_EXT] Looking for page 1: {path1}")
+    print(f"[MERGE_5C_EXT] Looking for page 2: {path2}")
+    print(f"[MERGE_5C_EXT] Page 1 exists: {os.path.exists(path1)}")
+    print(f"[MERGE_5C_EXT] Page 2 exists: {os.path.exists(path2)}")
+    
+    if not os.path.exists(path1) or not os.path.exists(path2):
+        return None, "❌ Missing temp pages. Please extract Page 1 and Page 2 first."
+    
+    try:
+        lut1 = np.load(path1)
+        lut2 = np.load(path2)
+        print(f"[MERGE_5C_EXT] Page 1 shape: {lut1.shape}")
+        print(f"[MERGE_5C_EXT] Page 2 shape: {lut2.shape}")
+
+        lut1_rgb = lut1.reshape(-1, 3)
+        lut2_rgb = lut2.reshape(-1, 3)
+        merged = np.vstack([lut1_rgb, lut2_rgb]).astype(np.uint8, copy=False)
+        print(f"[MERGE_5C_EXT] Merged shape: {merged.shape}")
+
+        np.save(LUT_FILE_PATH, merged)
+        print(f"[MERGE_5C_EXT] Saved merged LUT to: {LUT_FILE_PATH}")
+        
+        return LUT_FILE_PATH, "✅ 5-Color Extended LUT merged and saved! (2468 colors)"
+    except Exception as e:
+        print(f"[MERGE_5C_EXT] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, f"❌ Merge failed: {e}"
 
 
 # ═══════════════════════════════════════════════════════════════

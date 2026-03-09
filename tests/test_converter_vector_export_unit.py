@@ -16,9 +16,14 @@ sys.path.insert(0, _ROOT)
 
 # Stub heavy third-party modules that core.__init__ transitively imports
 # so we can test the converter without installing them in CI.
+# Use a smarter stub that preserves gr.update() behavior.
 for _mod_name in ("gradio", "gradio.themes"):
     if _mod_name not in sys.modules:
-        sys.modules[_mod_name] = MagicMock()
+        _mock = MagicMock()
+        # Preserve gr.update() returning a real dict so downstream tests work
+        if _mod_name == "gradio":
+            _mock.update = lambda **kwargs: {"__type__": "update", **kwargs}
+        sys.modules[_mod_name] = _mock
 
 import pytest
 import trimesh
@@ -149,7 +154,7 @@ class TestVectorBranchExport:
         dummy_lut = str(tmp_path / "dummy3.npy")
         np.save(dummy_lut, np.zeros(10))
 
-        out_path, glb_path, preview_img, msg = convert_image_to_3d(
+        out_path, glb_path, preview_img, msg, _ = convert_image_to_3d(
             image_path=str(svg_file),
             lut_path=dummy_lut,
             target_width_mm=20.0,

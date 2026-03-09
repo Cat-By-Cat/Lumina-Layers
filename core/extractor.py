@@ -55,7 +55,7 @@ def rotate_image(img, direction):
     return img
 
 
-def draw_corner_points(img, points, color_mode: str):
+def draw_corner_points(img, points, color_mode: str, page_choice: str | None = None):
     """Draw corner points with mode-specific colors and labels."""
     if img is None:
         return None
@@ -85,6 +85,22 @@ def draw_corner_points(img, points, color_mode: str):
             (140, 0, 236),    # Magenta (BGR)
             (42, 238, 244)    # Yellow (BGR)
         ]
+    elif "5-Color Extended" in color_mode:
+        if page_choice is not None and "2" in str(page_choice):
+            labels = ["蓝色 (左上)", "红色 (右上)", "黑色 (右下)", "黄色 (左下)"]
+            draw_colors = [
+                (240, 100, 0),    # Blue (BGR)
+                (60, 20, 220),    # Red (BGR)
+                (0, 0, 0),        # Black (BGR)
+                (0, 230, 255)     # Yellow (BGR)
+            ]
+        else:
+            draw_colors = [
+                (255, 255, 255),  # White
+                (60, 20, 220),    # Red (BGR)
+                (240, 100, 0),    # Blue (BGR)
+                (0, 230, 255)     # Yellow (BGR)
+            ]
     elif "CMYW" in color_mode:
         draw_colors = [
             (255, 255, 255),  # White
@@ -144,7 +160,7 @@ def apply_brightness_correction(img):
     return cv2.cvtColor(cv2.merge([l_new, a, b]), cv2.COLOR_LAB2RGB)
 
 
-def run_extraction(img, points, offset_x, offset_y, zoom, barrel, wb, bright, color_mode="CMYW"):
+def run_extraction(img, points, offset_x, offset_y, zoom, barrel, wb, bright, color_mode="CMYW", page_choice="Page 1"):
     """
     Main extraction pipeline with dynamic grid size support.
     
@@ -180,6 +196,18 @@ def run_extraction(img, points, offset_x, offset_y, zoom, barrel, wb, bright, co
         grid_size = 36          # 核心数据还是 36x36 (1296色)
         physical_grid = 38      # 物理上有 38x38 (含边框)
         total_cells = 1296
+    elif "5-Color Extended" in color_mode:
+        # 5-Color Extended dual-page mode
+        # Page 1: 32x32 = 1024 colors (5-layer)
+        # Page 2: 38x38 = 1444 colors (6-layer)
+        if "2" in str(page_choice):
+            grid_size = 38          # Page 2: 38x38 data
+            physical_grid = 40      # Physical: 40x40
+            total_cells = 1444
+        else:
+            grid_size = 32          # Page 1: 32x32 data
+            physical_grid = 34      # Physical: 34x34
+            total_cells = 1024
     else:
         grid_size = DATA_GRID_SIZE  # 32
         physical_grid = PHYSICAL_GRID_SIZE  # 34

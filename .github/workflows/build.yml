@@ -48,6 +48,9 @@ jobs:
         # 确保生成的 exe 文件名符合要求
         pyinstaller --noconfirm --onefile `
           --icon="icon.ico" `
+          --add-data "icon.ico;." `
+          --add-data "bambu_config_template.json;." `
+          --add-data "assets;assets" `
           --collect-all "gradio" `
           --collect-all "safehttpx" `
           --collect-all "groovy" `
@@ -72,6 +75,12 @@ jobs:
         }
         
         # 复制外部数据文件夹
+        if (Test-Path "icon.ico") {
+            Copy-Item -Path "icon.ico" -Destination "$targetDir/"
+        }
+        if (Test-Path "bambu_config_template.json") {
+            Copy-Item -Path "bambu_config_template.json" -Destination "$targetDir/"
+        }
         if (Test-Path "assets") {
             Copy-Item -Path "assets" -Destination "$targetDir/assets" -Recurse
         }
