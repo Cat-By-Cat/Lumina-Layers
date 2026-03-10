@@ -54,6 +54,16 @@ All notable changes to Lumina Studio are documented in this file.
 - Restored ZIP_DEFLATED compression and indent alignment
 - Removed leftover conflict marker in bambu_3mf_writer.py
 - Removed file_types from gr.Image calls (incompatible with Gradio 6.5.1)
+- Fixed SVG upload crash due to Gradio base64 preprocessing bug
+- Fixed SVG geometry crop: replaced pixel-based Dual-Pass Crop with geometry-based bounds crop
+- Fixed SVG even-odd fill rule when combining subpaths
+- Fixed icon.ico regenerated as square sizes and bundled in PyInstaller
+- Fixed slicer launch return count mismatch (5 outputs)
+- Fixed bambu_config_template.json not bundled in PyInstaller and artifact; fixed frozen path resolution
+- Removed unused create_5color_combination_tab and duplicate helper functions from layout_new.py
+
+### Features (Post-Release)
+- **Multi-Color LUT Support** - Added multi-color LUT support and color recipe query functionality
 
 ### Performance
 - Full pipeline speed optimization: SVG mode UI ~140s → ~51s (2.7x speedup)

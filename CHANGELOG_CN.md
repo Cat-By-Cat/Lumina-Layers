@@ -54,6 +54,16 @@ Lumina Studio 所有重要变更记录。
 - 恢复 ZIP_DEFLATED 压缩和缩进对齐
 - 移除 bambu_3mf_writer.py 中残留的冲突标记
 - 移除 gr.Image 调用中的 file_types（与 Gradio 6.5.1 不兼容）
+- 修复 SVG 上传因 Gradio base64 预处理 bug 导致崩溃
+- 修复 SVG 几何裁剪：将基于像素的双通道裁剪替换为基于几何边界的裁剪
+- 修复 SVG 合并子路径时的奇偶填充规则
+- 修复 icon.ico 重新生成为正方形尺寸并打包到 PyInstaller
+- 修复切片器启动返回值数量不匹配（5 个输出）
+- 修复 bambu_config_template.json 未打包到 PyInstaller 和构建产物；修复冻结路径解析
+- 移除 layout_new.py 中未使用的 create_5color_combination_tab 和重复辅助函数
+
+### 新功能（发布后补充）
+- **多颜色 LUT 支持** - 添加多颜色 LUT 支持和配色查询功能
 
 ### 性能优化
 - 全流程速度优化：SVG 模式 UI 耗时 ~140s → ~51s（2.7x 加速）
