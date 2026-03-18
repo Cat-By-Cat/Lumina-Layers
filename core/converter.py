@@ -277,8 +277,10 @@ def _normalize_color_replacements_input(color_replacements):
         for item in color_replacements:
             if not isinstance(item, dict):
                 continue
-            src = (item.get('matched') or item.get('source') or item.get('quantized') or '').strip().lower()
-            dst = (item.get('replacement') or '').strip().lower()
+            src = (item.get('matched') or item.get('matched_hex')
+                   or item.get('source') or item.get('quantized')
+                   or item.get('quantized_hex') or '').strip().lower()
+            dst = (item.get('replacement') or item.get('replacement_hex') or '').strip().lower()
             if src and dst:
                 out[src] = dst
         return out
@@ -476,6 +478,7 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
                          wire_height_mm=0.4,
                          free_color_set=None,
                          enable_coating=False, coating_height_mm=0.08,
+                         hue_weight: float = 0.0,
                          progress=None):
     """
     Main conversion function: Convert image to 3D model.
@@ -803,7 +806,7 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
     _hifi_t0 = time.perf_counter()
     
     try:
-        processor = LuminaImageProcessor(actual_lut_path, color_mode)
+        processor = LuminaImageProcessor(actual_lut_path, color_mode, hue_weight=hue_weight)
         processor.enable_cleanup = enable_cleanup
         result = processor.process_image(
             image_path=image_path,
@@ -828,17 +831,26 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
     debug_data = result.get('debug_data', None)
     
     # Apply color replacements if provided
-    if color_replacements:
+    # Also convert API-format replacement_regions (without masks) into color_replacements
+    effective_color_replacements = _normalize_color_replacements_input(color_replacements)
+    if replacement_regions:
+        api_format_replacements = _normalize_color_replacements_input(replacement_regions)
+        if api_format_replacements:
+            effective_color_replacements.update(api_format_replacements)
+            # Remove API-format items (no mask) from replacement_regions to avoid
+            # _apply_regions_to_raster_outputs skipping them silently
+            replacement_regions = [r for r in replacement_regions if r.get('mask') is not None]
+
+    if effective_color_replacements:
         from core.color_replacement import ColorReplacementManager
-        normalized_replacements = _normalize_color_replacements_input(color_replacements)
-        manager = ColorReplacementManager.from_dict(normalized_replacements)
+        manager = ColorReplacementManager.from_dict(effective_color_replacements)
         old_rgb = matched_rgb.copy()
         matched_rgb = manager.apply_to_image(matched_rgb)
         print(f"[CONVERTER] Applied {len(manager)} color replacements")
 
         # Update material_matrix: find the replacement color's LUT entry
         # and use its stacking layers (ref_stacks) for correct multi-layer output
-        for orig_hex, repl_hex in normalized_replacements.items():
+        for orig_hex, repl_hex in effective_color_replacements.items():
             orig_rgb_tuple = ColorReplacementManager._hex_to_color(orig_hex)
             repl_rgb_tuple = ColorReplacementManager._hex_to_color(repl_hex)
             # Find pixels that were originally this color
@@ -1477,33 +1489,8 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
     if preview_mesh:
         glb_path = os.path.join(OUTPUT_DIR, generate_preview_filename(base_name))
 
-        # Add physical bed platform to 3D preview
-        model_w_mm = target_w * pixel_scale
-        model_h_mm = target_h * pixel_scale
-        bed_w = max(model_w_mm + 20, 180)  # at least 180mm or model + margin
-        bed_h = max(model_h_mm + 20, 180)
-        # Snap to nearest standard bed
-        for _, bw, bh in BedManager.BEDS:
-            if bw >= bed_w and bh >= bed_h:
-                bed_w, bed_h = bw, bh
-                break
-        else:
-            bed_w, bed_h = BedManager.BEDS[-1][1], BedManager.BEDS[-1][2]
-
-        bed_mesh = _create_bed_mesh(bed_w, bed_h)
-        if bed_mesh is not None:
-            # Centre model on bed
-            model_offset_x = (bed_w - model_w_mm) / 2
-            model_offset_y = (bed_h - model_h_mm) / 2
-            shift = trimesh.transformations.translation_matrix([model_offset_x, model_offset_y, 0])
-            preview_mesh.apply_transform(shift)
-            # Use Scene to preserve bed texture in GLB
-            glb_scene = trimesh.Scene()
-            glb_scene.add_geometry(bed_mesh, node_name="bed")
-            glb_scene.add_geometry(preview_mesh, node_name="model")
-            glb_scene.export(glb_path)
-        else:
-            preview_mesh.export(glb_path)
+        # Export model-only GLB (bed platform is rendered by frontend)
+        preview_mesh.export(glb_path)
     else:
         glb_path = None
     
@@ -1536,10 +1523,8 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
         msg += f" | Loop: {slot_names[loop_info['color_id']]}"
     
     total_pixels = target_w * target_h
-    if glb_path is None and total_pixels > 2_000_000:
-        msg += " | ⚠️ Model too large, 3D preview disabled"
-    elif glb_path and total_pixels > 500_000:
-        msg += " | ℹ️ 3D preview simplified"
+    if glb_path and total_pixels > 500_000:
+        msg += " | 3D preview simplified"
     
     return out_path, glb_path, preview_img, msg, color_recipe_path
 
@@ -2232,16 +2217,24 @@ def _build_voxel_matrix_faceup(material_matrix, mask_solid, spacer_thick, backin
 
 
 def _create_bed_mesh(bed_w_mm, bed_h_mm, is_dark=True):
-    """Create a realistic print bed mesh with UV-mapped texture.
-    
-    Two themes:
-    - Dark (is_dark=True): PEI heated bed style, dark charcoal with subtle grid
-    - Light (is_dark=False): Marble/ceramic style, white with dark grid lines
-    
-    Returns a trimesh.Trimesh with TextureVisuals, or None on error.
+    """Create a rounded-corner print bed mesh with UV-mapped texture.
+    创建圆角打印热床网格，带 UV 贴图纹理。
+
+    The geometry outline matches the texture's rounded rectangle so that
+    no sharp-corner artifacts remain visible in the 3D preview.
+    几何轮廓与纹理的圆角矩形一致，避免 3D 预览中出现直角残留。
+
+    Args:
+        bed_w_mm (int): Bed width in mm. (热床宽度 mm)
+        bed_h_mm (int): Bed height in mm. (热床高度 mm)
+        is_dark (bool): Use dark PEI theme. (使用深色 PEI 主题)
+
+    Returns:
+        trimesh.Trimesh: Textured bed mesh, or None on error. (带纹理的热床网格)
     """
     try:
         from PIL import Image as PILImage, ImageDraw as PILDraw
+        from mapbox_earcut import triangulate_float64
 
         tex_scale = 4  # pixels per mm
         tex_w = int(bed_w_mm * tex_scale)
@@ -2249,26 +2242,23 @@ def _create_bed_mesh(bed_w_mm, bed_h_mm, is_dark=True):
         corner_r = int(8 * tex_scale)
         margin = max(2, corner_r // 4)
 
+        # Corner radius in world mm (matches texture margin/radius ratio)
+        r_mm = margin / tex_scale + corner_r / tex_scale
+
         if is_dark:
-            edge_color = (38, 38, 44)
             base_color = (58, 58, 66)
             fine_color = (42, 42, 48)
             bold_color = (90, 90, 100)
             border_color = (45, 45, 52)
         else:
-            edge_color = (215, 215, 220)
             base_color = (242, 242, 245)
             fine_color = (225, 225, 230)
             bold_color = (180, 180, 190)
             border_color = (195, 195, 205)
 
-        img = PILImage.new('RGB', (tex_w, tex_h), edge_color)
+        # --- Texture (fill entire image with base_color, no edge_color needed) ---
+        img = PILImage.new('RGB', (tex_w, tex_h), base_color)
         draw = PILDraw.Draw(img)
-
-        draw.rounded_rectangle(
-            [margin, margin, tex_w - margin, tex_h - margin],
-            radius=corner_r, fill=base_color
-        )
 
         step_10 = int(10 * tex_scale)
         for x in range(0, tex_w, step_10):
@@ -2287,22 +2277,51 @@ def _create_bed_mesh(bed_w_mm, bed_h_mm, is_dark=True):
             radius=corner_r, outline=border_color, width=3
         )
 
-        # Textured top quad
-        verts = np.array([
-            [0, 0, 0], [bed_w_mm, 0, 0],
-            [bed_w_mm, bed_h_mm, 0], [0, bed_h_mm, 0],
-        ], dtype=np.float64)
-        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
-        uv = np.array([[0, 1], [1, 1], [1, 0], [0, 0]], dtype=np.float64)
+        # --- Rounded-rectangle geometry outline (world coords, mm) ---
+        arc_segs = 16
+        angles = np.linspace(0, np.pi / 2, arc_segs + 1)
+        cos_a = np.cos(angles)
+        sin_a = np.sin(angles)
+
+        outline_pts = []
+        # Bottom-left corner (origin side)
+        for i in range(arc_segs + 1):
+            outline_pts.append([r_mm - r_mm * cos_a[i], r_mm - r_mm * sin_a[i]])
+        # Bottom-right corner
+        for i in range(arc_segs + 1):
+            outline_pts.append([bed_w_mm - r_mm + r_mm * sin_a[i], r_mm - r_mm * cos_a[i]])
+        # Top-right corner
+        for i in range(arc_segs + 1):
+            outline_pts.append([bed_w_mm - r_mm + r_mm * cos_a[i], bed_h_mm - r_mm + r_mm * sin_a[i]])
+        # Top-left corner
+        for i in range(arc_segs + 1):
+            outline_pts.append([r_mm - r_mm * sin_a[i], bed_h_mm - r_mm + r_mm * cos_a[i]])
+
+        outline_pts = np.array(outline_pts, dtype=np.float64)
+
+        # Triangulate the rounded-rect polygon via mapbox-earcut
+        rings = np.array([len(outline_pts)], dtype=np.int32)
+        tri_flat = triangulate_float64(outline_pts, rings)
+        tri_indices = np.array(tri_flat, dtype=np.int64).reshape(-1, 3)
+
+        # Build 3D vertices (Z=0) and UV coords
+        n_pts = len(outline_pts)
+        verts_3d = np.zeros((n_pts, 3), dtype=np.float64)
+        verts_3d[:, 0] = outline_pts[:, 0]
+        verts_3d[:, 1] = outline_pts[:, 1]
+
+        uv = np.zeros((n_pts, 2), dtype=np.float64)
+        uv[:, 0] = outline_pts[:, 0] / bed_w_mm
+        uv[:, 1] = 1.0 - outline_pts[:, 1] / bed_h_mm
 
         from trimesh.visual.material import SimpleMaterial
         from trimesh.visual import TextureVisuals
 
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        mesh = trimesh.Trimesh(vertices=verts_3d, faces=tri_indices, process=False)
         mesh.visual = TextureVisuals(uv=uv, material=SimpleMaterial(image=img))
 
         theme_name = "dark" if is_dark else "light"
-        print(f"[BED] Created {theme_name} {bed_w_mm}×{bed_h_mm}mm bed")
+        print(f"[BED] Created {theme_name} {bed_w_mm}×{bed_h_mm}mm rounded bed ({n_pts} verts)")
         return mesh
 
     except Exception as e:
@@ -2313,37 +2332,31 @@ def _create_bed_mesh(bed_w_mm, bed_h_mm, is_dark=True):
 
 
 def _create_preview_mesh(matched_rgb, mask_solid, total_layers, backing_color_id=0, backing_z_range=None, preview_colors=None):
-    """
-    Create simplified 3D preview mesh for browser display.
+    """Create simplified 3D preview mesh for browser display.
+    为浏览器显示创建简化的 3D 预览网格。
 
     Args:
-        matched_rgb: RGB color array
-        mask_solid: Boolean mask of solid pixels
-        total_layers: Total number of Z layers
-        backing_color_id: Backing material ID (0-7), default is 0 (White)
-        backing_z_range: Tuple of (start_z, end_z) for backing layer, or None
-        preview_colors: List of preview colors for materials
+        matched_rgb (np.ndarray): RGB color array of shape (H, W, 3). (RGB 颜色数组)
+        mask_solid (np.ndarray): Boolean mask of solid pixels of shape (H, W). (实心像素布尔掩码)
+        total_layers (int): Total number of Z layers. (Z 轴总层数)
+        backing_color_id (int): Backing material ID (0-7), default is 0 (White). (底板材料 ID)
+        backing_z_range (tuple): Tuple of (start_z, end_z) for backing layer, or None. (底板 Z 范围)
+        preview_colors (list): List of preview colors for materials. (材料预览颜色列表)
 
     Returns:
-        Trimesh object or None if model too large
+        trimesh.Trimesh: Simplified preview mesh, downsampled for large models. (简化预览网格，大模型会降采样)
     """
     height, width = matched_rgb.shape[:2]
     total_pixels = width * height
 
-    DISABLE_THRESHOLD = 2_000_000
     SIMPLIFY_THRESHOLD = 500_000
     TARGET_PIXELS = 300_000
-
-    if total_pixels > DISABLE_THRESHOLD:
-        print(f"[PREVIEW] Model too large ({total_pixels:,} pixels)")
-        print(f"[PREVIEW] 3D preview disabled to prevent crash")
-        return None
 
     if total_pixels > SIMPLIFY_THRESHOLD:
         scale_factor = int(np.sqrt(total_pixels / TARGET_PIXELS))
         scale_factor = max(2, min(scale_factor, 16))
 
-        print(f"[PREVIEW] Downsampling by {scale_factor}×")
+        print(f"[PREVIEW] Downsampling by {scale_factor}x ({total_pixels:,} -> ~{TARGET_PIXELS:,} pixels)")
 
         new_height = height // scale_factor
         new_width = width // scale_factor
@@ -2477,26 +2490,332 @@ def _create_preview_mesh(matched_rgb, mask_solid, total_layers, backing_color_id
     return mesh
 
 
-def generate_empty_bed_glb(is_dark=False):
+def generate_empty_bed_glb(bed_w: int = None, bed_h: int = None, is_dark: bool = False):
     """Generate a GLB file containing only the print bed (no model).
-    
-    Used as the default 3D preview before any model is generated.
-    
+    生成仅包含打印热床的 GLB 文件（无模型）。
+
+    Args:
+        bed_w (int): Bed width in mm. Defaults to BedManager default. (热床宽度 mm)
+        bed_h (int): Bed height in mm. Defaults to BedManager default. (热床高度 mm)
+        is_dark (bool): Use dark PEI theme. (使用深色 PEI 主题)
+
     Returns:
-        str: Path to GLB file, or None on failure.
+        str: Path to GLB file, or None on failure. (GLB 文件路径，失败返回 None)
     """
     try:
-        bed_w, bed_h = BedManager.get_bed_size(BedManager.DEFAULT_BED)
+        if bed_w is None or bed_h is None:
+            bed_w, bed_h = BedManager.get_bed_size(BedManager.DEFAULT_BED)
         bed_mesh = _create_bed_mesh(bed_w, bed_h, is_dark=is_dark)
         if bed_mesh is None:
             return None
         glb_scene = trimesh.Scene()
         glb_scene.add_geometry(bed_mesh, node_name="bed")
-        glb_path = os.path.join(OUTPUT_DIR, "empty_bed_preview.glb")
+        glb_path = os.path.join(OUTPUT_DIR, f"empty_bed_{bed_w}x{bed_h}.glb")
         glb_scene.export(glb_path)
         return glb_path
     except Exception as e:
         print(f"[EMPTY_BED] Failed: {e}")
+        return None
+
+
+def _merge_low_frequency_colors(
+    unique_colors: np.ndarray,
+    pixel_counts: np.ndarray,
+    max_meshes: int,
+) -> np.ndarray:
+    """Merge low-frequency colors into their nearest high-frequency neighbors.
+
+    Keeps the top ``max_meshes`` colors by pixel count and reassigns every
+    tail color to the closest kept color (Euclidean RGB distance).
+
+    Args:
+        unique_colors: (N, 3) uint8 array of unique RGB colors.
+        pixel_counts: (N,) int array of pixel counts per color.
+        max_meshes: Maximum number of colors to keep.
+
+    Returns:
+        (N, 3) uint8 array where tail colors are replaced by their nearest
+        kept color.  The first ``max_meshes`` entries are unchanged.
+    """
+    n = len(unique_colors)
+    if n <= max_meshes:
+        return unique_colors.copy()
+
+    order = np.argsort(-pixel_counts)
+    keep_indices = order[:max_meshes]
+    tail_indices = order[max_meshes:]
+
+    kept_colors = unique_colors[keep_indices].astype(np.float64)
+    merged = unique_colors.copy()
+
+    tail_rgb = unique_colors[tail_indices].astype(np.float64)
+    # Vectorized nearest-neighbor via broadcasting: (T, 1, 3) - (1, K, 3)
+    diff = tail_rgb[:, None, :] - kept_colors[None, :, :]
+    dist_sq = np.sum(diff ** 2, axis=2)
+    nearest = np.argmin(dist_sq, axis=1)
+
+    merged[tail_indices] = unique_colors[keep_indices[nearest]]
+    return merged
+
+
+def _build_color_voxel_mesh(
+    mask: np.ndarray,
+    height: int,
+    width: int,
+    total_layers: int,
+    shrink: float,
+    rgba: np.ndarray,
+) -> Optional[trimesh.Trimesh]:
+    """Build a voxelized Trimesh for pixels indicated by *mask*.
+
+    Each True pixel becomes a box spanning [x, x+1] x [world_y, world_y+1]
+    x [0, total_layers] with a small ``shrink`` gap, colored by ``rgba``.
+
+    Args:
+        mask: (H, W) bool array of pixels belonging to this color.
+        height: Image height after downsampling.
+        width: Image width after downsampling.
+        total_layers: Number of Z layers for the voxel height.
+        shrink: Inset amount for voxel gaps.
+        rgba: (4,) uint8 RGBA color for face coloring.
+
+    Returns:
+        A trimesh.Trimesh, or None if mask has no True pixels.
+    """
+    ys, xs = np.where(mask)
+    n_pixels = len(ys)
+    if n_pixels == 0:
+        return None
+
+    # Pre-allocate arrays for all cubes (8 verts, 12 faces each)
+    all_verts = np.empty((n_pixels * 8, 3), dtype=np.float64)
+    all_faces = np.empty((n_pixels * 12, 3), dtype=np.int64)
+    all_colors = np.empty((n_pixels * 12, 4), dtype=np.uint8)
+
+    cube_faces_template = np.array([
+        [0, 2, 1], [0, 3, 2],
+        [4, 5, 6], [4, 6, 7],
+        [0, 1, 5], [0, 5, 4],
+        [1, 2, 6], [1, 6, 5],
+        [2, 3, 7], [2, 7, 6],
+        [3, 0, 4], [3, 4, 7],
+    ], dtype=np.int64)
+
+    x0 = xs.astype(np.float64) + shrink
+    x1 = xs.astype(np.float64) + 1.0 - shrink
+    world_y = (height - 1 - ys).astype(np.float64)
+    y0 = world_y + shrink
+    y1 = world_y + 1.0 - shrink
+    z0 = np.zeros(n_pixels, dtype=np.float64)
+    z1 = np.full(n_pixels, float(total_layers), dtype=np.float64)
+
+    # Vectorized vertex construction: 8 corners per pixel
+    # Order matches _create_preview_mesh: [x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0],
+    #                                     [x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]
+    for i, (vx0, vx1, vy0, vy1, vz0, vz1) in enumerate(
+        zip(x0, x1, y0, y1, z0, z1)
+    ):
+        base = i * 8
+        all_verts[base:base + 8] = [
+            [vx0, vy0, vz0], [vx1, vy0, vz0], [vx1, vy1, vz0], [vx0, vy1, vz0],
+            [vx0, vy0, vz1], [vx1, vy0, vz1], [vx1, vy1, vz1], [vx0, vy1, vz1],
+        ]
+        face_base = i * 12
+        all_faces[face_base:face_base + 12] = cube_faces_template + base
+        all_colors[face_base:face_base + 12] = rgba
+
+    mesh = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=False)
+    mesh.visual.face_colors = all_colors
+    return mesh
+
+
+def generate_segmented_glb(cache: dict, max_meshes: int = 64) -> Optional[str]:
+    """Generate a color-segmented GLB preview with one named Mesh per color.
+
+    Each unique color in ``matched_rgb`` becomes an independent Mesh node
+    named ``color_<hex>`` (6-digit lowercase, no ``#`` prefix).  Every Mesh
+    has its origin at Z=0 (Pivot Point constraint) so the frontend can
+    scale along Z to stretch upward only.
+
+    When the number of unique colors exceeds *max_meshes*, low-frequency
+    colors are merged into their nearest high-frequency neighbor to keep
+    the Mesh count within budget.
+
+    Args:
+        cache: Preview cache dict containing at least:
+            - matched_rgb: (H, W, 3) uint8 array
+            - mask_solid: (H, W) bool array
+            - target_w, target_h: pixel dimensions
+            - target_width_mm: physical width in mm
+        max_meshes: Maximum Mesh count before merging (default 64).
+
+    Returns:
+        Path to the exported GLB file, or None on failure.
+    """
+    if cache is None:
+        return None
+
+    matched_rgb = cache.get('matched_rgb')
+    mask_solid = cache.get('mask_solid')
+    target_w = cache.get('target_w')
+    target_width_mm = cache.get('target_width_mm')
+
+    if matched_rgb is None or mask_solid is None:
+        return None
+
+    try:
+        # ------------------------------------------------------------------
+        # 1. Downsample large images (same logic as _create_preview_mesh)
+        # ------------------------------------------------------------------
+        height, width = matched_rgb.shape[:2]
+        total_pixels = width * height
+        SIMPLIFY_THRESHOLD = 500_000
+        TARGET_PIXELS = 300_000
+
+        if total_pixels > SIMPLIFY_THRESHOLD:
+            scale_factor = int(np.sqrt(total_pixels / TARGET_PIXELS))
+            scale_factor = max(2, min(scale_factor, 16))
+            print(f"[SEGMENTED_GLB] Downsampling by {scale_factor}x")
+
+            new_h = height // scale_factor
+            new_w = width // scale_factor
+            matched_rgb = cv2.resize(matched_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            mask_solid = cv2.resize(
+                mask_solid.astype(np.uint8), (new_w, new_h),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+            height, width = new_h, new_w
+            shrink = 0.05 * scale_factor
+        else:
+            shrink = 0.05
+
+        # ------------------------------------------------------------------
+        # 2. Extract unique colors and pixel counts (solid pixels only)
+        # ------------------------------------------------------------------
+        solid_pixels = matched_rgb[mask_solid]  # (N, 3)
+        if len(solid_pixels) == 0:
+            print("[SEGMENTED_GLB] No solid pixels, returning None")
+            return None
+
+        unique_colors, inverse, pixel_counts = np.unique(
+            solid_pixels, axis=0, return_inverse=True, return_counts=True,
+        )
+        n_unique = len(unique_colors)
+        print(f"[SEGMENTED_GLB] Found {n_unique} unique colors")
+
+        # ------------------------------------------------------------------
+        # 3. Merge low-frequency colors if exceeding max_meshes
+        # ------------------------------------------------------------------
+        if n_unique > max_meshes:
+            print(f"[SEGMENTED_GLB] Merging {n_unique} colors down to {max_meshes}")
+            merged_colors = _merge_low_frequency_colors(unique_colors, pixel_counts, max_meshes)
+            # Rebuild matched_rgb with merged colors for solid pixels
+            new_solid = merged_colors[inverse]
+            matched_rgb_work = matched_rgb.copy()
+            matched_rgb_work[mask_solid] = new_solid
+            # Re-extract unique colors after merge
+            solid_pixels = matched_rgb_work[mask_solid]
+            unique_colors, _, pixel_counts = np.unique(
+                solid_pixels, axis=0, return_inverse=True, return_counts=True,
+            )
+            matched_rgb = matched_rgb_work
+            print(f"[SEGMENTED_GLB] After merge: {len(unique_colors)} colors")
+
+        # ------------------------------------------------------------------
+        # 4. Build per-color Meshes
+        # ------------------------------------------------------------------
+        total_layers = 25  # Same as generate_realtime_glb
+        scene = trimesh.Scene()
+
+        # Physical scale: pixel coords -> mm
+        # Use current `width` (may be downsampled) instead of original `target_w`
+        pixel_scale = target_width_mm / width if width > 0 else 0.42
+        scale_transform = np.eye(4)
+        scale_transform[0, 0] = pixel_scale
+        scale_transform[1, 1] = pixel_scale
+        scale_transform[2, 2] = PrinterConfig.LAYER_HEIGHT
+
+        for color_rgb in unique_colors:
+            r, g, b = int(color_rgb[0]), int(color_rgb[1]), int(color_rgb[2])
+            hex_name = f"{r:02x}{g:02x}{b:02x}"
+            rgba = np.array([r, g, b, 255], dtype=np.uint8)
+
+            # Boolean mask for this color across the full image
+            color_match = np.all(matched_rgb == color_rgb, axis=2) & mask_solid
+
+            mesh = _build_color_voxel_mesh(
+                color_match, height, width, total_layers, shrink, rgba,
+            )
+            if mesh is None:
+                continue
+
+            # Apply physical scale
+            mesh.apply_transform(scale_transform)
+
+            # Pivot Point constraint: translate so min_z = 0
+            min_z = mesh.vertices[:, 2].min()
+            if min_z != 0.0:
+                mesh.vertices[:, 2] -= min_z
+
+            # Set MeshStandardMaterial color via vertex/face colors (already set)
+            scene.add_geometry(mesh, node_name=f"color_{hex_name}")
+
+        if len(scene.geometry) == 0:
+            print("[SEGMENTED_GLB] No meshes generated")
+            return None
+
+        # ------------------------------------------------------------------
+        # 5. Extract 2D contours for each color (for frontend outline rendering)
+        # ------------------------------------------------------------------
+        contours_data: dict[str, list[list[list[float]]]] = {}
+        for color_rgb in unique_colors:
+            r, g, b = int(color_rgb[0]), int(color_rgb[1]), int(color_rgb[2])
+            hex_name = f"{r:02x}{g:02x}{b:02x}"
+
+            color_match = np.all(matched_rgb == color_rgb, axis=2) & mask_solid
+            mask_u8 = color_match.astype(np.uint8) * 255
+
+            cv_contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cv_contours:
+                continue
+
+            color_contour_list: list[list[list[float]]] = []
+            for cnt in cv_contours:
+                if len(cnt) < 3:
+                    continue
+                # Convert pixel coords to mesh world coords (mm).
+                # OpenCV contour point (x_px, y_px) is at pixel boundary.
+                # Mesh Y uses: world_y = (height - 1 - y_px), box spans [world_y, world_y+1]
+                # So pixel row y_px top edge = height - y_px in mesh pixel space.
+                # Then multiply by pixel_scale to get mm.
+                # X is straightforward: x_mm = x_px * pixel_scale
+                pts = cnt.squeeze(1).astype(float)  # (N, 2)
+                world_pts: list[list[float]] = []
+                for px, py in pts:
+                    x_mm = float(px * pixel_scale)
+                    y_mm = float((height - py) * pixel_scale)
+                    world_pts.append([x_mm, y_mm])
+                color_contour_list.append(world_pts)
+
+            if color_contour_list:
+                contours_data[hex_name] = color_contour_list
+
+        # Store contours in cache for API to return
+        cache['color_contours'] = contours_data
+        print(f"[SEGMENTED_GLB] Extracted contours for {len(contours_data)} colors")
+
+        # ------------------------------------------------------------------
+        # 6. Export GLB
+        # ------------------------------------------------------------------
+        glb_path = os.path.join(OUTPUT_DIR, "segmented_preview.glb")
+        scene.export(glb_path)
+        print(f"[SEGMENTED_GLB] Exported {len(scene.geometry)} meshes -> {glb_path}")
+        return glb_path
+
+    except Exception as e:
+        print(f"[SEGMENTED_GLB] Failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -2541,40 +2860,21 @@ def generate_realtime_glb(cache):
             return None
         
         # Scale from pixel/voxel coords to mm
-        pixel_scale = target_width_mm / target_w if target_w > 0 else 0.42
+        # _create_preview_mesh may downsample internally, so we must compute
+        # pixel_scale from the mesh's actual bounding box width, not target_w.
+        mesh_width = preview_mesh.bounds[1][0] - preview_mesh.bounds[0][0]
+        pixel_scale = target_width_mm / mesh_width if mesh_width > 0 else 0.42
         transform = np.eye(4)
         transform[0, 0] = pixel_scale
         transform[1, 1] = pixel_scale
         transform[2, 2] = PrinterConfig.LAYER_HEIGHT
         preview_mesh.apply_transform(transform)
-
-        # Add bed platform
-        model_w_mm = target_w * pixel_scale
-        model_h_mm = target_h * pixel_scale
-        bed_w = max(model_w_mm + 20, 180)
-        bed_h = max(model_h_mm + 20, 180)
-        for _, bw, bh in BedManager.BEDS:
-            if bw >= bed_w and bh >= bed_h:
-                bed_w, bed_h = bw, bh
-                break
-        else:
-            bed_w, bed_h = BedManager.BEDS[-1][1], BedManager.BEDS[-1][2]
         
-        bed_mesh = _create_bed_mesh(bed_w, bed_h, is_dark=cache.get('is_dark', True))
-        if bed_mesh is not None:
-            model_offset_x = (bed_w - model_w_mm) / 2
-            model_offset_y = (bed_h - model_h_mm) / 2
-            shift = trimesh.transformations.translation_matrix([model_offset_x, model_offset_y, 0])
-            preview_mesh.apply_transform(shift)
-            # Use Scene to preserve bed texture in GLB
-            glb_scene = trimesh.Scene()
-            glb_scene.add_geometry(bed_mesh, node_name="bed")
-            glb_scene.add_geometry(preview_mesh, node_name="model")
-        else:
-            glb_scene = preview_mesh
-        
+        # Export model-only GLB (bed platform is rendered by frontend)
+        # Note: origin/main adds bed platform in Python for Gradio UI;
+        # the FastAPI+React frontend renders bed in Three.js instead.
         glb_path = os.path.join(OUTPUT_DIR, "realtime_preview.glb")
-        glb_scene.export(glb_path)
+        preview_mesh.export(glb_path)
         print(f"[REALTIME_GLB] ✅ Exported: {glb_path}")
         return glb_path
         
@@ -2591,7 +2891,8 @@ def generate_preview_cached(image_path, lut_path, target_width_mm,
                             quantize_colors: int = 64,
                             backing_color_id: int = 0,
                             enable_cleanup: bool = True,
-                            is_dark: bool = True):
+                            is_dark: bool = True,
+                            hue_weight: float = 0.0):
     """
     Generate preview and cache data
     For 2D preview interface
@@ -2635,13 +2936,14 @@ def generate_preview_cached(image_path, lut_path, target_width_mm,
     color_conf = ColorSystem.get(color_mode)
     
     try:
-        processor = LuminaImageProcessor(actual_lut_path, color_mode)
+        print(f"[Core generate_preview_cached] hue_weight={hue_weight}, color_mode={color_mode}")
+        processor = LuminaImageProcessor(actual_lut_path, color_mode, hue_weight=hue_weight)
         processor.enable_cleanup = enable_cleanup
         result = processor.process_image(
             image_path=image_path,
             target_width_mm=target_width_mm,
             modeling_mode=modeling_mode,
-            quantize_colors=quantize_colors,  # Use user-specified value
+            quantize_colors=quantize_colors,
             auto_bg=auto_bg,
             bg_tol=bg_tol,
             blur_kernel=0,
@@ -2982,6 +3284,7 @@ def generate_final_model(image_path, lut_path, target_width_mm, spacer_thick,
                         wire_height_mm=0.4,
                         free_color_set=None,
                         enable_coating=False, coating_height_mm=0.08,
+                        hue_weight: float = 0.0,
                         progress=None):
     """
     Wrapper function for generating final model.
@@ -3043,6 +3346,7 @@ def generate_final_model(image_path, lut_path, target_width_mm, spacer_thick,
         free_color_set=free_color_set,
         enable_coating=enable_coating,
         coating_height_mm=coating_height_mm,
+        hue_weight=hue_weight,
         progress=progress,
     )
 

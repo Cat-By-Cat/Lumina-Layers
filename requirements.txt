@@ -17,4 +17,8 @@ colormath
 svgelements>=1.9.0
 shapely>=2.0.0
 mapbox-earcut
+# FastAPI backend dependencies
+fastapi
+uvicorn
+httpx
 numba
